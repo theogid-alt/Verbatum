@@ -1,0 +1,39 @@
+[project]
+name = "verbatim-voice-pipeline"
+version = "0.1.0"
+description = "Verbatim v2 WebRTC voice-agent baseline using Daily/LiveKit Pipecat cascades and Hume comparison."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "httpx>=0.27.0",
+    "numba<0.62; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "onnxruntime<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
+    "livekit-api>=1.0.5,<2",
+    "pipecat-ai[cartesia,daily,deepgram,google,groq,livekit,openai,silero,ultravox]>=0.0.105,<1.1.0",
+    "pydantic-settings>=2.4.0",
+    "python-dotenv>=1.0.1",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "respx>=0.21.1",
+]
+
+[project.scripts]
+verbatim-server = "verbatim.server:main"
+verbatim-latency = "verbatim.analytics.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/verbatim"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

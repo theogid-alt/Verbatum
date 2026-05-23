@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Verbatim V2</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script crossorigin src="https://unpkg.com/@daily-co/daily-js"></script>
+    <script crossorigin src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Verbatim V2</p>
+          <h1>Voice Agent Console</h1>
+        </div>
+        <div class="status" id="status">Loading</div>
+      </header>
+
+      <section class="controls">
+        <div class="control-group">
+          <span>Transport</span>
+          <div id="transportButtons" class="button-row"></div>
+        </div>
+        <div class="control-group">
+          <span>STT</span>
+          <div id="sttButtons" class="button-row"></div>
+        </div>
+        <div class="control-group wide">
+          <span>LLM</span>
+          <div id="llmButtons" class="button-row"></div>
+        </div>
+        <div class="control-group">
+          <span>Room</span>
+          <div class="button-row">
+            <button id="prepareButton" type="button">Create Room</button>
+            <button id="startAgentButton" type="button">Start Agent</button>
+            <button id="joinButton" type="button">Join</button>
+            <button id="leaveButton" type="button">Leave</button>
+            <button id="stopAgentButton" type="button" class="danger">Kill Agent</button>
+          </div>
+        </div>
+        <div class="control-group wide">
+          <span>Tools</span>
+          <div class="tool-row">
+            <input id="clientIdInput" placeholder="client_id" />
+            <input id="callerPhoneInput" placeholder="caller phone for SMS, e.g. +336..." />
+            <label class="checkbox-label">
+              <input id="toolsEnabledInput" type="checkbox" />
+              Enable tools
+            </label>
+            <button id="connectCalendarButton" type="button">Connect Calendar</button>
+            <button id="integrationStatusButton" type="button">Status</button>
+          </div>
+          <div id="integrationStatusLine" class="config-line compact-line"></div>
+        </div>
+      </section>
+
+      <section class="call-context">
+        <div class="context-field">
+          <label for="knowledgeBaseInput">Call KB</label>
+          <textarea id="knowledgeBaseInput" rows="5" placeholder="Paste listing details, business rules, FAQs, or client-specific knowledge for this call."></textarea>
+        </div>
+        <div class="context-field">
+          <div class="context-head">
+            <label for="callNotesOutput">Call notes</label>
+            <button id="refreshCallNotesButton" type="button">Refresh</button>
+          </div>
+          <pre id="callNotesOutput" class="call-notes-output">Generated notes will appear after transcript or tool activity.</pre>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <div class="room-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Room</p>
+              <h2 id="roomTitle">Not connected</h2>
+            </div>
+            <input id="roomUrl" readonly placeholder="Room URL/session endpoint" />
+          </div>
+          <div id="roomMount" class="room-mount"></div>
+        </div>
+
+        <aside class="metrics-panel">
+          <p class="eyebrow">Latency</p>
+          <div class="metric-grid">
+            <div><span>Avg</span><strong id="metricAvg">n/a</strong></div>
+            <div><span>P95</span><strong id="metricP95">n/a</strong></div>
+            <div><span>STT</span><strong id="metricStt">n/a</strong></div>
+            <div><span>TTFT</span><strong id="metricTtft">n/a</strong></div>
+            <div><span>TTS</span><strong id="metricTts">n/a</strong></div>
+            <div><span>Playback</span><strong id="metricPlayback">n/a</strong></div>
+            <div><span>Errors</span><strong id="metricErrors">0</strong></div>
+          </div>
+          <div id="configLine" class="config-line"></div>
+          <div id="networkLine" class="config-line"></div>
+        </aside>
+      </section>
+
+      <section class="lower">
+        <div class="terminal">
+          <div class="panel-head compact">
+            <h2>Terminal</h2>
+            <span id="callIdLabel">No call</span>
+          </div>
+          <pre id="terminalLog"></pre>
+        </div>
+        <div class="transcript">
+          <div class="panel-head compact">
+            <h2>Transcript</h2>
+          </div>
+          <div id="transcriptList"></div>
+        </div>
+      </section>
+    </main>
+    <script src="/static/app.js?v=20260523-generated-call-notes"></script>
+  </body>
+</html>

@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Verbatim Voice Test</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script crossorigin src="https://unpkg.com/@daily-co/daily-js"></script>
+    <script
+      crossorigin
+      src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"
+    ></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Verbatim</p>
+          <h1>Voice Pipeline Test</h1>
+        </div>
+        <div class="status" id="status">Idle</div>
+      </header>
+
+      <section class="controls" aria-label="Call controls">
+        <button id="prepareButton" type="button">Create Room</button>
+        <button id="startAgentButton" type="button" disabled>Start Agent</button>
+        <button id="joinButton" type="button" disabled>Join Call</button>
+        <button id="openRoomButton" type="button" disabled>Open Daily Room</button>
+        <button id="killAgentButton" class="danger-button" type="button" disabled>Kill Agent</button>
+        <button id="leaveButton" type="button" disabled>Leave</button>
+      </section>
+
+      <section class="engine-panel" aria-label="WebRTC transport">
+        <div>
+          <p class="eyebrow">Transport</p>
+          <h2>WebRTC Provider</h2>
+        </div>
+        <div class="engine-buttons" role="group" aria-label="WebRTC transport">
+          <button id="dailyTransportButton" class="engine-button active" type="button">Daily</button>
+          <button id="livekitTransportButton" class="engine-button" type="button">LiveKit</button>
+          <button id="humeTransportButton" class="engine-button" type="button">Hume EVI</button>
+        </div>
+        <div class="engine-current" id="transportCurrent">Daily</div>
+      </section>
+
+      <section class="engine-panel" aria-label="Daily media region">
+        <div>
+          <p class="eyebrow">Daily</p>
+          <h2>Media Region</h2>
+        </div>
+        <div class="engine-buttons" role="group" aria-label="Daily media region">
+          <button id="dailyRegionAutoButton" class="engine-button" type="button">Auto</button>
+          <button id="dailyRegionFrankfurtButton" class="engine-button active" type="button">
+            Frankfurt
+          </button>
+          <button id="dailyRegionLondonButton" class="engine-button" type="button">London</button>
+        </div>
+        <div class="engine-current" id="dailyRegionCurrent">Frankfurt · eu-central-1</div>
+      </section>
+
+      <section class="engine-panel" aria-label="STT engine">
+        <div>
+          <p class="eyebrow">STT</p>
+          <h2>Recognition Engine</h2>
+        </div>
+        <div class="engine-buttons" role="group" aria-label="Recognition engine">
+          <button id="fluxButton" class="engine-button" type="button">Flux</button>
+          <button id="novaButton" class="engine-button active" type="button">Nova-3</button>
+        </div>
+        <div class="engine-current" id="engineCurrent">Nova-3 · nova-3-general</div>
+      </section>
+
+      <section class="engine-panel" aria-label="LLM engine">
+        <div>
+          <p class="eyebrow">LLM</p>
+          <h2>Response Engine</h2>
+        </div>
+        <div class="engine-buttons" role="group" aria-label="Response engine">
+          <button id="geminiButton" class="engine-button active" type="button">Gemini</button>
+          <button id="groqButton" class="engine-button" type="button">Groq</button>
+          <button id="openaiButton" class="engine-button" type="button">OpenAI</button>
+          <button id="qwenButton" class="engine-button" type="button">Qwen</button>
+          <button id="xaiButton" class="engine-button" type="button">xAI</button>
+          <button id="ultravoxButton" class="engine-button" type="button">UltraVox</button>
+          <button id="mockLlmButton" class="engine-button" type="button">Mock</button>
+        </div>
+        <div class="engine-current" id="llmCurrent">Gemini · gemini-2.5-flash</div>
+      </section>
+
+      <section class="engine-panel" aria-label="Latency diagnostic mode">
+        <div>
+          <p class="eyebrow">Mode</p>
+          <h2>Latency Diagnostic</h2>
+        </div>
+        <div class="engine-buttons" role="group" aria-label="Latency diagnostic mode">
+          <button id="diagnosticButton" class="engine-button active" type="button">Aggressive</button>
+        </div>
+        <div class="engine-current" id="diagnosticCurrent">Nova-3 · Gemini Flash · 32 tokens</div>
+      </section>
+
+      <section class="room">
+        <label id="roomUrlLabel" for="roomUrl">Daily room</label>
+        <input id="roomUrl" type="url" placeholder="Daily room URL" autocomplete="off" />
+      </section>
+
+      <section class="room-stage" aria-label="WebRTC call and latency">
+        <section id="callFrame" class="call-frame" aria-label="WebRTC call"></section>
+        <aside class="latency-panel" aria-label="Latency vitals">
+          <div class="latency-panel-head">
+            <div>
+              <p class="eyebrow">Latency</p>
+              <h2>Live Vitals</h2>
+            </div>
+            <div class="latency-pill" id="latencyHealth">Idle</div>
+          </div>
+          <div class="latency-primary">
+            <div>
+              <span>Perceived</span>
+              <strong id="latencyPerceived">n/a</strong>
+            </div>
+            <div>
+              <span>p95</span>
+              <strong id="latencyP95">n/a</strong>
+            </div>
+          </div>
+          <div class="latency-list">
+            <div><span>Transcript to audio</span><strong id="latencyTranscriptPlayback">n/a</strong></div>
+            <div><span>Commit gap</span><strong id="latencyTranscriptEnqueue">n/a</strong></div>
+            <div><span>Turn detect</span><strong id="latencyTurnDetection">n/a</strong></div>
+            <div><span>LLM TTFT</span><strong id="latencyLlmTtft">n/a</strong></div>
+            <div><span>Provider</span><strong id="latencyProviderTtfb">n/a</strong></div>
+            <div><span>TTS audio</span><strong id="latencyTtsAudio">n/a</strong></div>
+            <div><span>Clean p95</span><strong id="latencyCleanP95">n/a</strong></div>
+            <div><span>Interruptions</span><strong id="latencyInterruptions">n/a</strong></div>
+            <div><span>Splits / early</span><strong id="latencyTurnQuality">n/a</strong></div>
+            <div><span>Form failures</span><strong id="latencyFormFailures">n/a</strong></div>
+          </div>
+          <div class="latency-meta">
+            <div id="latencyModel">Gemini · gemini-2.5-flash</div>
+            <div id="latencyCall">call: none</div>
+          </div>
+        </aside>
+      </section>
+
+      <section class="metrics bot-console" aria-label="Bot terminal">
+        <div class="metrics-head">
+          <div>
+            <p class="eyebrow">Bot</p>
+            <h2>Live Terminal</h2>
+          </div>
+          <div class="metric-status" id="metricsStatus">Waiting</div>
+        </div>
+        <pre id="botTerminal" class="bot-terminal">Waiting for bot events...</pre>
+      </section>
+
+      <section class="transcript" aria-label="Transcript">
+        <div class="metrics-head">
+          <div>
+            <p class="eyebrow">ASR</p>
+            <h2>Live Transcript</h2>
+          </div>
+          <div class="metric-status" id="transcriptStatus">Waiting</div>
+        </div>
+        <div class="transcript-layout">
+          <div class="transcript-feed" id="transcriptFeed"></div>
+          <div class="asr-events">
+            <h3>STT Events</h3>
+            <ul id="sttEvents"></ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="log" aria-label="Event log">
+        <pre id="log"></pre>
+      </section>
+    </main>
+
+    <script src="/static/app.js?v=20260517-transport-stability"></script>
+  </body>
+</html>
