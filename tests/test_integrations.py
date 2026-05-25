@@ -26,6 +26,7 @@ from verbatim.integrations.tools import (
     build_scheduling_tools_schema,
     scheduling_tools_ready,
 )
+from verbatim.pipelines.pipecat import _unverified_tool_claim_replacement
 
 
 class FakeNango:
@@ -760,6 +761,22 @@ def test_booking_status_and_suggested_slot_acceptance_cover_natural_confirmation
 def test_sms_status_questions_are_tool_turns_not_llm_promises():
     assert _asks_sms_status("Did you send it to me?")
     assert _asks_sms_status("I still haven't received any confirmation message.")
+
+
+def test_llm_tool_truth_guard_blocks_fake_booking_and_sms_claims():
+    class Recorder:
+        calendar_booking_confirmed = False
+        sms_followup_sent = False
+
+    recorder = Recorder()
+
+    assert _unverified_tool_claim_replacement("Done, I booked the viewing.", recorder)
+    assert _unverified_tool_claim_replacement("I sent the SMS confirmation.", recorder)
+
+    recorder.calendar_booking_confirmed = True
+    recorder.sms_followup_sent = True
+    assert _unverified_tool_claim_replacement("Done, I booked the viewing.", recorder) is None
+    assert _unverified_tool_claim_replacement("I sent the SMS confirmation.", recorder) is None
 
 
 def test_calendar_response_suggests_next_slot_on_conflict():

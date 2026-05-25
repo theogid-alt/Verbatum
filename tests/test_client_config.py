@@ -102,7 +102,9 @@ def test_start_agent_uses_saved_prompt_kb_and_profile_id(monkeypatch, tmp_path):
 
     assert response.status_code == 200
     assert captured["client_id"] == "demo"
-    assert captured["system_prompt"] == "Saved prompt."
+    assert captured["system_prompt"].startswith("Saved prompt.")
+    assert "Assistant name: Alicia." in captured["system_prompt"]
+    assert "Business name: Demo Business." in captured["system_prompt"]
     assert captured["knowledge_base"] == "Saved KB."
 
 

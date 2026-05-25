@@ -283,7 +283,13 @@ def create_app():
                 "client_id": client_id,
                 "caller_phone": _caller_phone_from_payload(payload),
                 "knowledge_base": _effective_knowledge_base(settings, payload, client_config=client_config),
-                "system_prompt": _effective_system_prompt(settings, payload, client_config=client_config),
+                "system_prompt": _effective_system_prompt(
+                    settings,
+                    payload,
+                    client_config=client_config,
+                    tools_enabled=tools_enabled,
+                    enabled_tools=enabled_tools if tools_enabled else [],
+                ),
                 "enabled_tools": enabled_tools if tools_enabled else [],
                 "tools_enabled": tools_enabled,
                 "stt_provider": settings.providers.stt_provider,
@@ -636,22 +642,78 @@ def _effective_knowledge_base(settings, payload: dict[str, Any], *, client_confi
     return value[:12000] or None
 
 
-def _effective_system_prompt(settings, payload: dict[str, Any], *, client_config: ClientConfig | None = None) -> str:
+def _effective_system_prompt(
+    settings,
+    payload: dict[str, Any],
+    *,
+    client_config: ClientConfig | None = None,
+    tools_enabled: bool = False,
+    enabled_tools: list[str] | None = None,
+) -> str:
     override = _call_text_from_payload(payload, "system_prompt", max_chars=12000)
-    if override:
-        return override
     client_config = client_config or _client_config(settings)
-    return (client_config.prompt or settings.prompt.system_prompt).strip() or settings.prompt.system_prompt
+    prompt = (override or client_config.prompt or settings.prompt.system_prompt).strip() or settings.prompt.system_prompt
+    return _compose_agent_system_prompt(
+        prompt,
+        client_config=client_config,
+        tools_enabled=tools_enabled,
+        enabled_tools=enabled_tools,
+    )
 
 
 def _effective_hume_system_prompt(settings, payload: dict[str, Any], *, client_config: ClientConfig | None = None) -> str:
     override = _call_text_from_payload(payload, "system_prompt", max_chars=12000)
-    if override:
-        return override
     client_config = client_config or _client_config(settings)
-    if client_config.prompt.strip():
-        return client_config.prompt.strip()
-    return settings.prompt.hume_evi_system_prompt or settings.prompt.system_prompt
+    prompt = override or client_config.prompt.strip() or settings.prompt.hume_evi_system_prompt or settings.prompt.system_prompt
+    return _compose_agent_system_prompt(prompt, client_config=client_config)
+
+
+def _compose_agent_system_prompt(
+    prompt: str,
+    *,
+    client_config: ClientConfig,
+    tools_enabled: bool = False,
+    enabled_tools: list[str] | None = None,
+) -> str:
+    parts = [prompt.strip()]
+    profile_context = _client_profile_prompt_context(client_config)
+    if profile_context:
+        parts.append(profile_context)
+    if tools_enabled:
+        parts.append(_tool_truth_prompt(enabled_tools or []))
+    return "\n\n".join(part for part in parts if part)
+
+
+def _client_profile_prompt_context(client_config: ClientConfig) -> str:
+    profile = client_config.profile or {}
+    assistant_name = str(profile.get("assistant_name") or "").strip()
+    business_name = str(profile.get("business_name") or "").strip()
+    industry = str(profile.get("industry") or "").strip()
+    timezone = str(profile.get("timezone") or "").strip()
+    lines = []
+    if assistant_name:
+        lines.append(f"Assistant name: {assistant_name}.")
+    if business_name:
+        lines.append(f"Business name: {business_name}.")
+    if industry:
+        lines.append(f"Industry: {industry}.")
+    if timezone:
+        lines.append(f"Timezone: {timezone}.")
+    if not lines:
+        return ""
+    lines.append("Use this identity only when useful; do not invent a city, company, or caller intent.")
+    return "Saved client profile:\n" + "\n".join(lines)
+
+
+def _tool_truth_prompt(enabled_tools: list[str]) -> str:
+    tool_list = ", ".join(sorted(set(enabled_tools))) or "none"
+    return (
+        "Tool truth rules:\n"
+        f"Enabled tools: {tool_list}.\n"
+        "Never claim availability, booking, deletion, or SMS success from memory or intention.\n"
+        "Only say a tool action succeeded after the tool result says it succeeded.\n"
+        "If the calendar or SMS tool is unavailable or fails, say that directly and offer follow-up."
+    )
 
 
 def _tools_enabled_from_payload(settings, payload: dict[str, Any]) -> bool:

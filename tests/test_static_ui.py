@@ -69,3 +69,4 @@ def test_tools_controls_are_default_and_sent_to_agent_start():
     assert 'type="checkbox"' in Path("static/index.html").read_text()
     assert "Reset to Current Stack" in Path("static/index.html").read_text()
     assert "Evaluate Current Call" in Path("static/index.html").read_text()
+    assert 'value="v02"' in Path("static/index.html").read_text()

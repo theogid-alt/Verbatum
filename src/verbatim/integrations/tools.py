@@ -430,6 +430,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             self.last_booking_id: str | None = None
             self.last_suggested_action: dict[str, Any] | None = None
             self.pending_sms_body: str | None = None
+            self.last_sms_response: str | None = None
             self.awaiting_sms_offer_response = False
 
         async def process_frame(self, frame, direction: FrameDirection):
@@ -576,6 +577,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 self.last_booking_id = None
                 self.last_suggested_action = None
                 self.pending_sms_body = None
+                self.last_sms_response = None
                 self.awaiting_sms_offer_response = False
             await self._push_response(response_text, direction)
 
@@ -592,6 +594,9 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
         async def _handle_sms_followup_turn(self, *, latest_text: str, recent_tail: str, direction: FrameDirection) -> bool:
             wants_sms = _asks_for_sms_followup(latest_text)
             asks_sms_status = _asks_sms_status(latest_text)
+            if asks_sms_status and self.last_sms_response:
+                await self._push_response(self.last_sms_response, direction)
+                return True
             if "send_sms_followup" not in enabled_tools:
                 if wants_sms or asks_sms_status:
                     recorder.emit(
@@ -681,10 +686,12 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 once_per_turn=True,
             )
             result = await _run_followup_action(runtime, action)
+            response_text = _followup_response_text(action, result)
             if result.get("ok"):
                 self.pending_sms_body = None
                 self.awaiting_sms_offer_response = False
-            await self._push_response(_followup_response_text(action, result), direction)
+                self.last_sms_response = "Yes, I sent the viewing confirmation."
+            await self._push_response(response_text, direction)
 
     return CalendarActionProcessor()
 

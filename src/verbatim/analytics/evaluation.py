@@ -19,7 +19,7 @@ EVALUATION_SCHEMA = "verbatim.v2.evaluation"
 CONTEXT_SCHEMA = "verbatim.v2.evaluation_context"
 SUMMARY_SCHEMA = "verbatim.v2.evaluation_summary"
 RUBRIC_VERSION = 2
-DEFAULT_BOT_VERSION = "v01"
+DEFAULT_BOT_VERSION = "v02"
 
 
 DEFAULT_RUBRIC_FIELDS: tuple[dict[str, Any], ...] = (
@@ -124,7 +124,7 @@ def build_call_evaluation_context(
     selected = [event for event in events if call_id and event.get("call_id") == call_id]
     selected.sort(key=lambda item: item.get("timestamp_monotonic_ms") or 0)
     version = _safe_bot_version(bot_version)
-    saved = load_call_evaluation(settings, call_id=call_id, bot_version=version) if call_id else None
+    saved = load_call_evaluation(settings, call_id=call_id, bot_version=bot_version) if call_id else None
     if saved and saved.get("bot_version"):
         version = _safe_bot_version(saved.get("bot_version"))
     return {

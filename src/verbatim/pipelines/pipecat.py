@@ -79,6 +79,8 @@ class PipelineRecorder:
         self.last_user_speech_stopped_at_ms: float | None = None
         self.latest_user_text: str | None = None
         self.recent_user_texts: list[str] = []
+        self.calendar_booking_confirmed = False
+        self.sms_followup_sent = False
 
     @property
     def llm_provider(self) -> str:
@@ -104,7 +106,17 @@ class PipelineRecorder:
             if event_name in seen:
                 return {}
             seen.add(event_name)
+        self._track_tool_truth_state(event_name, metadata or {})
         return self.sink.emit(event_name, provider=provider, turn_id=resolved_turn_id, metadata=metadata or {})
+
+    def _track_tool_truth_state(self, event_name: str, metadata: dict[str, Any]) -> None:
+        if event_name != "tool.call.completed":
+            return
+        tool_name = str(metadata.get("tool_name") or "")
+        if tool_name == "confirm_calendar_booking" and metadata.get("booking_booked"):
+            self.calendar_booking_confirmed = True
+        if tool_name == "send_sms_followup" and metadata.get("sms_sent"):
+            self.sms_followup_sent = True
 
     def next_turn(self) -> str:
         self.turn_index += 1
@@ -343,7 +355,7 @@ async def _run_cascade_pipeline(settings, session, recorder, Pipeline, PipelineR
             _probe("pre_llm", recorder),
             llm,
             _probe("llm", recorder),
-            _identity_bleed_guard(recorder),
+            _llm_output_guard(recorder, session),
             tts,
             _probe("tts", recorder),
             transport.output(),
@@ -424,16 +436,18 @@ def _probe(name: str, recorder: PipelineRecorder):
     return Probe()
 
 
-def _identity_bleed_guard(recorder: PipelineRecorder):
+def _llm_output_guard(recorder: PipelineRecorder, session: AgentSession):
     from pipecat.frames.frames import LLMTextFrame
     from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-    blocked_terms = ["du" + "bai", "cr" + "tg", "ali" + "cia"]
-    fallback = "I help with real estate questions. What would you like to know?"
+    allowed_identity_text = f"{session.system_prompt or ''}\n{session.knowledge_base or ''}".lower()
+    stale_identity_terms = ["du" + "bai", "cr" + "tg", "ali" + "cia"]
+    blocked_terms = [term for term in stale_identity_terms if term not in allowed_identity_text]
+    identity_fallback = "I help with real estate questions. What would you like to know?"
 
-    class IdentityBleedGuard(FrameProcessor):
+    class LLMOutputGuard(FrameProcessor):
         def __init__(self) -> None:
-            super().__init__(name="v2-identity-bleed-guard")
+            super().__init__(name="v2-llm-output-guard")
 
         async def process_frame(self, frame, direction: FrameDirection):
             await super().process_frame(frame, direction)
@@ -446,10 +460,40 @@ def _identity_bleed_guard(recorder: PipelineRecorder):
                         provider=recorder.llm_provider,
                         metadata={"llm_provider": recorder.llm_provider, "llm_model": recorder.llm_model},
                     )
-                    frame.text = fallback
+                    frame.text = identity_fallback
+                else:
+                    tool_truth_fallback = _unverified_tool_claim_replacement(text, recorder)
+                    if tool_truth_fallback:
+                        recorder.emit(
+                            "llm.tool_truth_blocked",
+                            provider=recorder.llm_provider,
+                            metadata={
+                                "llm_provider": recorder.llm_provider,
+                                "llm_model": recorder.llm_model,
+                                "text_preview": text[:160],
+                            },
+                        )
+                        frame.text = tool_truth_fallback
             await self.push_frame(frame, direction)
 
-    return IdentityBleedGuard()
+    return LLMOutputGuard()
+
+
+def _unverified_tool_claim_replacement(text: str, recorder: PipelineRecorder) -> str | None:
+    lowered = text.lower()
+    if not recorder.calendar_booking_confirmed and re.search(
+        r"\b(done|confirmed|scheduled|booked|added)\b.*\b(viewing|appointment|calendar|booking)\b|"
+        r"\b(viewing|appointment|booking)\b.*\b(done|confirmed|scheduled|booked|added)\b",
+        lowered,
+    ):
+        return "I need to check the calendar before I can confirm that."
+    if not recorder.sms_followup_sent and re.search(
+        r"\b(sent|texted|messaged)\b.*\b(sms|text|message|confirmation)\b|"
+        r"\b(sms|text|message|confirmation)\b.*\b(sent|texted|messaged)\b",
+        lowered,
+    ):
+        return "I have not sent the SMS yet."
+    return None
 
 
 def _build_transport(settings: Settings, session: AgentSession):
