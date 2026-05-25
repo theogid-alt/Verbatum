@@ -154,7 +154,9 @@ def test_integration_status_is_browser_safe(monkeypatch, tmp_path):
     payload = response.json()
     assert payload["client_id"] == "client-a"
     assert "nango-secret" not in str(payload)
-    assert payload["integrations"][0]["allowed_tools"]
+    google_calendar = next(card for card in payload["cards"] if card["id"] == "google_calendar")
+    assert google_calendar["allowed_tools"]
+    assert google_calendar["status"] == "not_connected"
 
 
 def test_start_agent_rejects_ultravox_tool_combo(monkeypatch, tmp_path):

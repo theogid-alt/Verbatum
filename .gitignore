@@ -1,6 +1,11 @@
 .env
 .DS_Store
 .venv/
+client/profile.json
+client/prompt.md
+client/kb.md
+client/integrations.json
+client/evaluation_rubric.json
 __pycache__/
 *.py[cod]
 .pytest_cache/

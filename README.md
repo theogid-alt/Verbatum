@@ -38,6 +38,21 @@ Hume remains available in the UI for comparison.
 
 Tool calling runs by default on compatible Pipecat cascade calls when at least one safe tool backend is ready. Benchmark-only calls can still disable it with `VERBATIM_TOOLS_ENABLED=false`.
 
+The dashboard terminal shows safe tool facts while a call is running, including `calendar_checked`, `calendar_has_conflict`, `booking_booked`, `sms_sent`, `to_phone`, and duration. Calendar writes still require a confirmed booking path; SMS confirmation is sent only after a real booking exists.
+
+## Local Client Kit
+
+Verbatim now works as a cloneable local operator kit. Each cloned folder creates local client files on first dashboard load:
+
+```text
+client/profile.json
+client/prompt.md
+client/kb.md
+client/integrations.json
+```
+
+These files are ignored by git so client-specific prompts, KB, and enabled integrations stay local to that cloned agent folder. The dashboard edits them with explicit Save buttons, then uses the saved prompt and persistent KB automatically on calls. Integration cards show what is configured, missing from `.env`, connected, disabled, or coming soon. Secrets still live only in `.env`.
+
 The first client-owned integration path is Nango-backed Google Calendar:
 
 ```bash
@@ -149,3 +164,15 @@ uv run verbatim-latency --call-id call_xxx
 ```
 
 The v2 dashboard intentionally tracks only the stable core metrics: perceived latency, provider TTFT, TTS first audio, playback delay, errors, transcript, and browser connection stats.
+
+## Offline Evaluation
+
+The evaluation layer is manual and post-call only. It reads existing v2 events, transcript logs, and call notes, then saves reviewer scorecards without touching the live agent worker.
+
+```text
+./client/evaluation_rubric.json
+./data/verbatim/evaluations/{bot_version}/{call_id}.json
+./data/verbatim/evaluation_runs/{run_id}.json
+```
+
+Open the dashboard and click `Evaluate Current Call` after a test call. Set the bot version, for example `v01` or `v02`, score each field from 1-5, add optional notes, then click `Save Evaluation`. The summary endpoint groups reports by version so 100-call batches can be averaged cleanly. The v2 rubric is benchmark-inspired, with fields for realism, tool calling, latency, STT, intelligence, task success, conversation flow, and faithfulness/safety. No LLM judge, audio recording, or automatic pass/fail is enabled in v1.

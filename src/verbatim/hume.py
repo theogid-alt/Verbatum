@@ -18,6 +18,7 @@ async def create_hume_evi_session(
     call_id: str,
     session_id: str,
     knowledge_base: str | None = None,
+    system_prompt: str | None = None,
 ) -> dict[str, Any]:
     missing = missing_hume_keys(settings)
     if missing:
@@ -42,6 +43,7 @@ async def create_hume_evi_session(
             settings,
             session_id=session_id,
             knowledge_base=knowledge_base,
+            system_prompt=system_prompt,
         ),
     }
 
@@ -66,6 +68,7 @@ def hume_session_settings(
     *,
     session_id: str,
     knowledge_base: str | None = None,
+    system_prompt: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": "session_settings",
@@ -75,7 +78,7 @@ def hume_session_settings(
         payload["voice_id"] = settings.providers.hume_evi_voice_id
     if settings.providers.hume_evi_send_system_prompt:
         payload["system_prompt"] = _session_system_prompt(
-            settings.prompt.hume_evi_system_prompt or settings.prompt.system_prompt or default_hume_prompt(),
+            system_prompt or settings.prompt.hume_evi_system_prompt or settings.prompt.system_prompt or default_hume_prompt(),
             knowledge_base=knowledge_base,
         )
     return payload

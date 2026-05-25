@@ -178,6 +178,18 @@ class IntegrationStore:
             ).fetchall()
         return [_connection_from_row(row) for row in rows]
 
+    def delete_connection(self, *, client_id: str, provider: str, integration_key: str) -> bool:
+        self.init_db()
+        with self._lock, sqlite3.connect(self.path) as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM integration_connections
+                WHERE client_id = ? AND provider = ? AND integration_key = ?
+                """,
+                (client_id, provider, integration_key),
+            )
+        return bool(cursor.rowcount)
+
     def create_pending_booking(
         self,
         *,

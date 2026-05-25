@@ -31,6 +31,8 @@ async def amain() -> None:
             client_id=_optional_str(payload.get("client_id")),
             caller_phone=_optional_str(payload.get("caller_phone")),
             knowledge_base=_optional_str(payload.get("knowledge_base")),
+            system_prompt=_optional_str(payload.get("system_prompt")),
+            enabled_tools=[str(value) for value in payload.get("enabled_tools", []) if value],
             tools_enabled=bool(payload.get("tools_enabled", False)),
         ),
     )

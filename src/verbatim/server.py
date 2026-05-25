@@ -10,15 +10,24 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from verbatim.analytics.call_notes import generate_call_notes
+from verbatim.analytics.evaluation import (
+    build_call_evaluation_context,
+    load_rubric,
+    save_call_evaluation,
+    summarize_evaluations,
+)
 from verbatim.analytics.latency import summarize_call_events
+from verbatim.client_config import ClientConfig, ClientConfigStore, integration_definitions
 from verbatim.config import clear_settings_cache, get_settings, validate_runtime_selection
 from verbatim.events import EventSink, load_events, new_id, normalize_event_name, safe_metadata
 from verbatim.hume import HumeError, create_hume_evi_session
 from verbatim.integrations.followup import twilio_sms_configured
 from verbatim.integrations.nango import NangoClient, NangoError
-from verbatim.integrations.store import CALENDAR_TOOL_NAMES, IntegrationStore
-from verbatim.integrations.tools import verbatim_tools_ready
+from verbatim.integrations.store import IntegrationStore
+from verbatim.integrations.tools import followup_tool_names, scheduling_tool_names
 from verbatim.rooms import DailyRoomManager, LiveKitRoomManager, RoomError, resolve_room
 
 
@@ -69,27 +78,114 @@ def create_app():
         settings = get_settings()
         return _browser_config(settings)
 
+    @app.get("/api/client-config")
+    async def client_config():
+        settings = get_settings()
+        return _client_config_response(settings)
+
+    @app.put("/api/client-config/profile")
+    async def update_client_profile(payload: dict[str, Any]):
+        settings = get_settings()
+        profile = _client_store().update_profile(settings, payload or {})
+        clear_settings_cache()
+        return _client_config_response(get_settings(), profile_override=profile)
+
+    @app.put("/api/client-config/prompt")
+    async def update_client_prompt(payload: dict[str, Any]):
+        settings = get_settings()
+        content = str((payload or {}).get("content") or "")
+        _client_store().update_prompt(settings, content)
+        clear_settings_cache()
+        return _client_config_response(get_settings())
+
+    @app.put("/api/client-config/kb")
+    async def update_client_kb(payload: dict[str, Any]):
+        settings = get_settings()
+        content = str((payload or {}).get("content") or "")
+        _client_store().update_kb(settings, content)
+        return _client_config_response(settings)
+
+    @app.post("/api/client-config/reset")
+    async def reset_client_profile_prompt_kb():
+        settings = get_settings()
+        reset_config = _client_store().reset_profile_prompt_kb(settings)
+        clear_settings_cache()
+        return _client_config_payload(get_settings(), client_config=reset_config)
+
+    @app.put("/api/client-config/integrations")
+    async def update_client_integrations(payload: dict[str, Any]):
+        settings = get_settings()
+        _client_store().update_integrations(settings, payload or {})
+        return _client_config_response(settings)
+
     @app.get("/api/integrations/catalog")
     async def integrations_catalog():
         settings = get_settings()
         return _integration_catalog(settings)
 
+    @app.post("/api/integrations/{integration_id}/test")
+    async def integration_test(integration_id: str):
+        settings = get_settings()
+        client_config = _client_config(settings)
+        client_id = client_config.profile_id
+        await _refresh_nango_connections(settings, client_id=client_id)
+        cards = _integration_cards(settings, client_config=client_config, client_id=client_id)
+        card = next((item for item in cards if item["id"] == integration_id), None)
+        if not card:
+            raise HTTPException(status_code=404, detail=f"Unknown integration: {integration_id}")
+        if not card["implemented"]:
+            return {"ok": False, "integration_id": integration_id, "status": "coming_soon", "message": "This adapter is not implemented yet."}
+        if not card["enabled"]:
+            return {"ok": False, "integration_id": integration_id, "status": "disabled", "message": "This integration is disabled locally."}
+        if not card["ready"]:
+            return {
+                "ok": False,
+                "integration_id": integration_id,
+                "status": card["status"],
+                "message": card["status_label"],
+                "required_env": card["required_env"],
+            }
+        if card["provider"] == "webhook":
+            return await _test_webhook_integration(settings, integration_id=integration_id, card=card)
+        return {"ok": True, "integration_id": integration_id, "status": card["status"], "message": f"{card['label']} is ready."}
+
+    @app.post("/api/integrations/{integration_id}/disconnect")
+    async def integration_disconnect(integration_id: str):
+        settings = get_settings()
+        client_config = _client_config(settings)
+        definition = next((item for item in integration_definitions(settings) if item["id"] == integration_id), None)
+        if not definition:
+            raise HTTPException(status_code=404, detail=f"Unknown integration: {integration_id}")
+        _client_store().disconnect_integration(settings, integration_id)
+        if definition["provider"] == "nango":
+            _integration_store(settings).delete_connection(
+                client_id=client_config.profile_id,
+                provider="nango",
+                integration_key=definition["integration_key"],
+            )
+        return _client_config_response(settings)
+
     @app.post("/api/integrations/nango/connect-session")
     async def nango_connect_session(payload: dict[str, Any] | None = None):
         settings = get_settings()
         payload = payload or {}
-        client_id = _client_id_from_payload(settings, payload)
-        integration_key = _integration_key(settings, payload.get("integration_key"))
+        client_config = _client_config(settings)
+        client_id = _client_id_from_payload(settings, payload, client_config=client_config)
+        definition = _integration_definition_from_payload(settings, payload)
+        if not definition or definition.get("provider") != "nango":
+            raise HTTPException(status_code=400, detail="This integration does not use Nango Connect.")
+        integration_key = str(definition["integration_key"])
         if not settings.integrations.nango_secret_key:
             raise HTTPException(status_code=400, detail="NANGO_SECRET_KEY is required to create a Nango Connect session.")
         store = _integration_store(settings)
+        _client_store().update_integrations(settings, {"integrations": {definition["id"]: {"enabled": True}}})
         store.upsert_connection(
             client_id=client_id,
             provider="nango",
             integration_key=integration_key,
             connection_id=None,
             status="pending",
-            allowed_tools=CALENDAR_TOOL_NAMES,
+            allowed_tools=list(definition.get("allowed_tools") or []),
         )
         try:
             session = await NangoClient(settings).create_connect_session(
@@ -103,6 +199,7 @@ def create_app():
         return {
             "client_id": client_id,
             "integration_provider": "nango",
+            "integration_id": definition["id"],
             "integration_key": integration_key,
             "connect_link": session.get("connect_link"),
             "expires_at": session.get("expires_at"),
@@ -121,6 +218,7 @@ def create_app():
         await _cancel_active_agent()
         clear_settings_cache()
         settings = _settings_from_payload(payload or {}, include_llm=False)
+        client_config = _client_config(settings)
         if settings.providers.transport_provider == "hume_evi":
             raise HTTPException(status_code=400, detail="Hume EVI uses /api/hume/evi/session.")
         try:
@@ -139,8 +237,8 @@ def create_app():
             "source": room.source,
             "call_id": call_id,
             "session_id": session_id,
-            "client_id": _client_id_from_payload(settings, payload or {}),
-            "tools_enabled": _tools_enabled_from_payload(settings, payload or {}),
+            "client_id": _client_id_from_payload(settings, payload or {}, client_config=client_config),
+            "tools_enabled": _effective_tools_enabled(settings, payload or {}, client_config=client_config),
         }
 
     @app.post("/api/agent/start")
@@ -149,16 +247,22 @@ def create_app():
         clear_settings_cache()
         payload = payload or {}
         settings = _settings_from_payload(payload, include_llm=True)
+        client_config = _client_config(settings)
+        client_id = _client_id_from_payload(settings, payload, client_config=client_config)
+        enabled_tools = _enabled_tool_names(settings, client_config=client_config, client_id=client_id)
+        requested_tools_enabled = _tools_enabled_from_payload(settings, payload)
+        tools_enabled = requested_tools_enabled and bool(enabled_tools)
         if settings.providers.transport_provider == "hume_evi":
             raise HTTPException(status_code=400, detail="Hume EVI runs in the browser via /api/hume/evi/session.")
         try:
             validate_runtime_selection(settings)
-            if _tools_enabled_from_payload(settings, payload) and settings.providers.llm_provider == "ultravox":
+            if requested_tools_enabled and settings.providers.llm_provider == "ultravox":
                 raise ValueError("Tool calling is only supported for text LLM + Cartesia cascade calls.")
-            if _tools_enabled_from_payload(settings, payload):
-                client_id = _client_id_from_payload(settings, payload)
+            if requested_tools_enabled:
                 await _refresh_nango_connections(settings, client_id=client_id)
-                _validate_tools_ready(settings, client_id=client_id)
+                enabled_tools = _enabled_tool_names(settings, client_config=_client_config(settings), client_id=client_id)
+                _validate_tools_ready(enabled_tools)
+                tools_enabled = bool(enabled_tools)
             missing = settings.missing_agent_keys()
             if missing:
                 raise ValueError(f"Missing required agent environment variables: {', '.join(missing)}")
@@ -176,10 +280,12 @@ def create_app():
                 "room_name": room_name,
                 "call_id": call_id,
                 "session_id": session_id,
-                "client_id": _client_id_from_payload(settings, payload),
+                "client_id": client_id,
                 "caller_phone": _caller_phone_from_payload(payload),
-                "knowledge_base": _call_text_from_payload(payload, "knowledge_base", max_chars=12000),
-                "tools_enabled": _tools_enabled_from_payload(settings, payload),
+                "knowledge_base": _effective_knowledge_base(settings, payload, client_config=client_config),
+                "system_prompt": _effective_system_prompt(settings, payload, client_config=client_config),
+                "enabled_tools": enabled_tools if tools_enabled else [],
+                "tools_enabled": tools_enabled,
                 "stt_provider": settings.providers.stt_provider,
                 "deepgram_model": settings.providers.deepgram_model,
                 "llm_provider": settings.providers.llm_provider,
@@ -200,11 +306,12 @@ def create_app():
             "llm_model": settings.providers.llm_model,
             "tts_provider": "ultravox" if settings.providers.llm_provider == "ultravox" else "cartesia",
             "tts_model": settings.providers.llm_model if settings.providers.llm_provider == "ultravox" else settings.voice.cartesia_model,
-            "client_id": _client_id_from_payload(settings, payload),
+            "client_id": client_id,
             "caller_phone_configured": bool(_caller_phone_from_payload(payload)),
-            "knowledge_base_configured": bool(_call_text_from_payload(payload, "knowledge_base", max_chars=12000)),
-            "knowledge_base_chars": len(_call_text_from_payload(payload, "knowledge_base", max_chars=12000) or ""),
-            "tools_enabled": _tools_enabled_from_payload(settings, payload),
+            "knowledge_base_configured": bool(_effective_knowledge_base(settings, payload, client_config=client_config)),
+            "knowledge_base_chars": len(_effective_knowledge_base(settings, payload, client_config=client_config) or ""),
+            "tools_enabled": tools_enabled,
+            "enabled_tools": enabled_tools if tools_enabled else [],
         }
 
     @app.post("/api/agent/stop")
@@ -232,15 +339,17 @@ def create_app():
         clear_settings_cache()
         payload = payload or {}
         settings = get_settings()
+        client_config = _client_config(settings)
         call_id = new_id("call")
         session_id = new_id("sess")
-        knowledge_base = _call_text_from_payload(payload, "knowledge_base", max_chars=12000)
+        knowledge_base = _effective_knowledge_base(settings, payload, client_config=client_config)
         try:
             session = await create_hume_evi_session(
                 settings,
                 call_id=call_id,
                 session_id=session_id,
                 knowledge_base=knowledge_base,
+                system_prompt=_effective_hume_system_prompt(settings, payload, client_config=client_config),
             )
         except HumeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -316,6 +425,29 @@ def create_app():
         items = load_events(transcript_path) if transcript_path else []
         return {"call_id": selected_call_id, "items": items[-100:]}
 
+    @app.get("/api/evaluations/rubric")
+    async def evaluations_rubric():
+        return load_rubric()
+
+    @app.get("/api/evaluations/call")
+    async def evaluations_call(call_id: str | None = None, bot_version: str | None = None):
+        settings = get_settings()
+        events = load_events(settings.instrumentation.event_log_path)
+        selected_call_id = call_id or _latest_call_id(events)
+        return build_call_evaluation_context(settings, events, call_id=selected_call_id, bot_version=bot_version)
+
+    @app.put("/api/evaluations/call/{call_id}")
+    async def evaluations_save_call(call_id: str, payload: dict[str, Any]):
+        settings = get_settings()
+        events = load_events(settings.instrumentation.event_log_path)
+        return save_call_evaluation(settings, events, call_id=call_id, payload=payload or {})
+
+    @app.get("/api/evaluations/summary")
+    async def evaluations_summary():
+        settings = get_settings()
+        events = load_events(settings.instrumentation.event_log_path)
+        return summarize_evaluations(settings, events)
+
     return app
 
 
@@ -336,23 +468,26 @@ def _settings_from_payload(payload: dict[str, Any], *, include_llm: bool) -> Any
 
 
 def _browser_config(settings) -> dict[str, Any]:
+    client_config = _client_config(settings)
+    profile = client_config.profile
     return {
-        "transport_provider": settings.providers.transport_provider,
-        "stt_provider": settings.providers.stt_provider,
-        "stt_model": settings.providers.deepgram_model,
-        "llm_provider": settings.providers.llm_provider,
-        "llm_model": settings.providers.llm_model,
+        "transport_provider": profile.get("transport_provider") or settings.providers.transport_provider,
+        "stt_provider": profile.get("stt_provider") or settings.providers.stt_provider,
+        "stt_model": profile.get("deepgram_model") or settings.providers.deepgram_model,
+        "llm_provider": profile.get("llm_provider") or settings.providers.llm_provider,
+        "llm_model": profile.get("llm_model") or settings.providers.llm_model,
         "tts_provider": "cartesia",
         "tts_model": settings.voice.cartesia_model,
         "cartesia_voice_configured": bool(settings.voice.cartesia_voice_id),
         "hume_evi_configured": bool(settings.providers.hume_api_key and settings.providers.hume_secret_key),
-        "default_client_id": settings.integrations.default_client_id,
+        "default_client_id": client_config.profile_id,
         "tools_enabled": settings.integrations.tools_enabled,
         "tool_timeout_ms": settings.integrations.tool_timeout_ms,
         "caller_phone": "",
-        "knowledge_base": "",
+        "knowledge_base": client_config.knowledge_base,
+        "client_config": _client_config_payload(settings, client_config=client_config),
         "direct_tools_configured": followup_tools_ready_for_browser(settings),
-        "integration_catalog": _integration_catalog(settings),
+        "integration_catalog": _integration_catalog(settings, client_config=client_config),
         "transport_options": [
             {"id": "livekit", "label": "LiveKit", "transport_provider": "livekit"},
             {"id": "daily", "label": "Daily", "transport_provider": "daily"},
@@ -380,12 +515,13 @@ def _browser_config(settings) -> dict[str, Any]:
     }
 
 
-def _integration_catalog(settings) -> dict[str, Any]:
-    integration_key = settings.integrations.nango_google_calendar_integration_id
-    direct_tools = []
-    if twilio_sms_configured(settings):
-        direct_tools.append("send_sms_followup")
+def _integration_catalog(settings, *, client_config: ClientConfig | None = None) -> dict[str, Any]:
+    client_config = client_config or _client_config(settings)
+    cards = _integration_cards(settings, client_config=client_config, client_id=client_config.profile_id)
+    calendar = next((card for card in cards if card["id"] == "google_calendar"), None)
+    twilio = next((card for card in cards if card["id"] == "twilio_sms"), None)
     return {
+        "cards": cards,
         "providers": [
             {
                 "id": "nango",
@@ -393,28 +529,28 @@ def _integration_catalog(settings) -> dict[str, Any]:
                 "configured": bool(settings.integrations.nango_secret_key),
                 "integrations": [
                     {
-                        "integration_key": integration_key,
+                        "integration_key": settings.integrations.nango_google_calendar_integration_id,
                         "label": "Google Calendar",
-                        "status": "available" if settings.integrations.nango_secret_key else "needs_nango_secret",
-                        "allowed_tools": CALENDAR_TOOL_NAMES,
+                        "status": calendar["status"] if calendar else "not_connected",
+                        "allowed_tools": calendar["allowed_tools"] if calendar and calendar["enabled"] else [],
                     }
                 ],
             },
             {
                 "id": "direct",
                 "label": "Direct APIs",
-                "configured": bool(direct_tools),
+                "configured": bool(twilio and twilio["ready"]),
                 "integrations": [
                     {
                         "integration_key": "twilio-messaging",
                         "label": "Twilio SMS",
-                        "status": "available" if twilio_sms_configured(settings) else "needs_twilio_keys",
-                        "allowed_tools": ["send_sms_followup"] if twilio_sms_configured(settings) else [],
+                        "status": twilio["status"] if twilio else "missing_env",
+                        "allowed_tools": twilio["allowed_tools"] if twilio and twilio["enabled"] and twilio["ready"] else [],
                     },
                 ],
             },
         ],
-        "default_client_id": settings.integrations.default_client_id,
+        "default_client_id": client_config.profile_id,
         "tools_enabled": settings.integrations.tools_enabled,
     }
 
@@ -423,12 +559,60 @@ def _integration_store(settings) -> IntegrationStore:
     return IntegrationStore(settings.integrations.integrations_db_path)
 
 
+def _client_store() -> ClientConfigStore:
+    return ClientConfigStore()
+
+
+def _client_config(settings) -> ClientConfig:
+    return _client_store().read(settings)
+
+
+def _client_config_response(settings, *, profile_override: dict[str, Any] | None = None) -> dict[str, Any]:
+    client_config = _client_config(settings)
+    if profile_override is not None:
+        client_config = ClientConfig(
+            profile=profile_override,
+            prompt=client_config.prompt,
+            knowledge_base=client_config.knowledge_base,
+            integrations=client_config.integrations,
+        )
+    return _client_config_payload(settings, client_config=client_config)
+
+
+def _client_config_payload(settings, *, client_config: ClientConfig) -> dict[str, Any]:
+    return {
+        "profile": client_config.profile,
+        "prompt": {"content": client_config.prompt, "configured": bool(client_config.prompt.strip())},
+        "knowledge_base": {
+            "content": client_config.knowledge_base,
+            "configured": bool(client_config.knowledge_base.strip()),
+            "chars": len(client_config.knowledge_base or ""),
+        },
+        "integrations": client_config.integrations,
+        "integration_catalog": _integration_catalog(settings, client_config=client_config),
+    }
+
+
 def _integration_key(settings, value: Any | None = None) -> str:
     return str(value or settings.integrations.nango_google_calendar_integration_id).strip()
 
 
-def _client_id_from_payload(settings, payload: dict[str, Any]) -> str:
-    return str(payload.get("client_id") or settings.integrations.default_client_id).strip() or "demo"
+def _integration_definition_from_payload(settings, payload: dict[str, Any]) -> dict[str, Any] | None:
+    integration_id = str(payload.get("integration_id") or "").strip()
+    integration_key = str(payload.get("integration_key") or "").strip()
+    definitions = integration_definitions(settings)
+    if integration_id:
+        match = next((item for item in definitions if item["id"] == integration_id), None)
+        if match:
+            return match
+    if integration_key:
+        return next((item for item in definitions if item["integration_key"] == integration_key), None)
+    return next((item for item in definitions if item["id"] == "google_calendar"), None)
+
+
+def _client_id_from_payload(settings, payload: dict[str, Any], *, client_config: ClientConfig | None = None) -> str:
+    client_config = client_config or _client_config(settings)
+    return str(payload.get("client_id") or client_config.profile_id or settings.integrations.default_client_id).strip() or "demo"
 
 
 def _caller_phone_from_payload(payload: dict[str, Any]) -> str | None:
@@ -443,6 +627,33 @@ def _call_text_from_payload(payload: dict[str, Any], key: str, *, max_chars: int
     return value[:max_chars]
 
 
+def _effective_knowledge_base(settings, payload: dict[str, Any], *, client_config: ClientConfig | None = None) -> str | None:
+    override = _call_text_from_payload(payload, "knowledge_base", max_chars=12000)
+    if override:
+        return override
+    client_config = client_config or _client_config(settings)
+    value = (client_config.knowledge_base or "").strip()
+    return value[:12000] or None
+
+
+def _effective_system_prompt(settings, payload: dict[str, Any], *, client_config: ClientConfig | None = None) -> str:
+    override = _call_text_from_payload(payload, "system_prompt", max_chars=12000)
+    if override:
+        return override
+    client_config = client_config or _client_config(settings)
+    return (client_config.prompt or settings.prompt.system_prompt).strip() or settings.prompt.system_prompt
+
+
+def _effective_hume_system_prompt(settings, payload: dict[str, Any], *, client_config: ClientConfig | None = None) -> str:
+    override = _call_text_from_payload(payload, "system_prompt", max_chars=12000)
+    if override:
+        return override
+    client_config = client_config or _client_config(settings)
+    if client_config.prompt.strip():
+        return client_config.prompt.strip()
+    return settings.prompt.hume_evi_system_prompt or settings.prompt.system_prompt
+
+
 def _tools_enabled_from_payload(settings, payload: dict[str, Any]) -> bool:
     if "tools_enabled" not in payload or payload.get("tools_enabled") is None:
         return bool(settings.integrations.tools_enabled)
@@ -452,10 +663,18 @@ def _tools_enabled_from_payload(settings, payload: dict[str, Any]) -> bool:
     return bool(value)
 
 
-def _validate_tools_ready(settings, *, client_id: str) -> None:
-    if not verbatim_tools_ready(settings, client_id=client_id):
+def _effective_tools_enabled(settings, payload: dict[str, Any], *, client_config: ClientConfig | None = None) -> bool:
+    if not _tools_enabled_from_payload(settings, payload):
+        return False
+    client_config = client_config or _client_config(settings)
+    client_id = _client_id_from_payload(settings, payload, client_config=client_config)
+    return bool(_enabled_tool_names(settings, client_config=client_config, client_id=client_id))
+
+
+def _validate_tools_ready(enabled_tools: list[str]) -> None:
+    if not enabled_tools:
         raise ValueError(
-            "No Verbatim tools are ready. Connect Google Calendar through Nango or configure Twilio SMS in .env."
+            "No enabled Verbatim tools are ready. Connect Google Calendar through Nango, enable an integration card, or configure Twilio SMS in .env."
         )
 
 
@@ -463,45 +682,168 @@ def followup_tools_ready_for_browser(settings) -> bool:
     return twilio_sms_configured(settings)
 
 
+def _integration_cards(settings, *, client_config: ClientConfig, client_id: str) -> list[dict[str, Any]]:
+    integration_state = client_config.integrations.get("integrations") or {}
+    store = _integration_store(settings)
+    cards: list[dict[str, Any]] = []
+    for definition in integration_definitions(settings):
+        state = integration_state.get(definition["id"], {})
+        enabled = bool(state.get("enabled")) if definition["implemented"] else False
+        status = "coming_soon"
+        status_label = "Coming soon"
+        ready = False
+        connection_id = None
+        missing_env: list[str] = []
+        if definition["implemented"]:
+            if not enabled:
+                status = "disabled"
+                status_label = "Disabled locally"
+            elif definition["provider"] == "nango":
+                if not settings.integrations.nango_secret_key:
+                    status = "missing_env"
+                    status_label = "Add NANGO_SECRET_KEY to .env"
+                    missing_env = ["NANGO_SECRET_KEY"]
+                else:
+                    connection = store.get_connection(
+                        client_id=client_id,
+                        provider="nango",
+                        integration_key=definition["integration_key"],
+                    )
+                    connection_id = connection.connection_id if connection else None
+                    raw_status = (connection.status if connection else "not_connected").lower()
+                    if connection_id and raw_status not in {"not_connected", "pending", "failed", "expired"}:
+                        status = "connected"
+                        status_label = "Connected" if raw_status != "error" else "Connected, proxy test recommended"
+                        ready = True
+                    else:
+                        status = raw_status or "not_connected"
+                        status_label = "Connect through Nango"
+            elif definition["id"] == "twilio_sms":
+                if twilio_sms_configured(settings):
+                    status = "configured"
+                    status_label = "Configured"
+                    ready = True
+                else:
+                    status = "missing_env"
+                    status_label = "Add Twilio SMS keys to .env"
+                    missing_env = definition["required_env"]
+            elif definition["provider"] in {"webhook", "manual_api"}:
+                if definition.get("configured"):
+                    status = "configured"
+                    status_label = "Configured"
+                    ready = True
+                else:
+                    status = "missing_env"
+                    status_label = f"Add {', '.join(definition['required_env'])} to .env"
+                    missing_env = list(definition["required_env"])
+            else:
+                status = "configured"
+                status_label = "Local feature ready"
+                ready = True
+        cards.append(
+            {
+                **definition,
+                "enabled": enabled,
+                "ready": ready,
+                "status": status,
+                "status_label": status_label,
+                "connection_id": connection_id,
+                "missing_env": missing_env,
+                "disconnected_at": state.get("disconnected_at"),
+            }
+        )
+    return cards
+
+
+def _enabled_tool_names(settings, *, client_config: ClientConfig, client_id: str) -> list[str]:
+    names: list[str] = []
+    for card in _integration_cards(settings, client_config=client_config, client_id=client_id):
+        if card["implemented"] and card["enabled"] and card["ready"]:
+            names.extend(card.get("allowed_tools") or [])
+    return sorted(set(names))
+
+
+async def _test_webhook_integration(settings, *, integration_id: str, card: dict[str, Any]) -> dict[str, Any]:
+    url_by_id = {
+        "make": settings.integrations.make_webhook_url,
+        "zapier": settings.integrations.zapier_webhook_url,
+        "n8n": settings.integrations.n8n_webhook_url,
+        "webhook": settings.integrations.generic_webhook_url,
+    }
+    url = url_by_id.get(integration_id)
+    if not url:
+        return {
+            "ok": False,
+            "integration_id": integration_id,
+            "status": "missing_env",
+            "message": card["status_label"],
+            "required_env": card["required_env"],
+        }
+    started = time.monotonic()
+    payload = {
+        "event": "verbatim.integration_test",
+        "integration_id": integration_id,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(url, json=payload)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        return {
+            "ok": False,
+            "integration_id": integration_id,
+            "status": "webhook_failed",
+            "message": f"{card['label']} webhook test failed: {exc.__class__.__name__}",
+            "duration_ms": round((time.monotonic() - started) * 1000, 1),
+        }
+    return {
+        "ok": True,
+        "integration_id": integration_id,
+        "status": "configured",
+        "message": f"{card['label']} webhook accepted the test event.",
+        "duration_ms": round((time.monotonic() - started) * 1000, 1),
+    }
+
+
 async def _refresh_nango_connections(settings, *, client_id: str) -> None:
     if not settings.integrations.nango_secret_key:
         return
-    integration_key = settings.integrations.nango_google_calendar_integration_id
+    client_config = _client_config(settings)
+    integration_state = client_config.integrations.get("integrations") or {}
     store = _integration_store(settings)
-    try:
-        connections = await NangoClient(settings).list_connections(client_id=client_id, integration_key=integration_key)
-    except NangoError:
-        return
-    for connection in connections:
-        if not connection.connection_id:
+    nango = NangoClient(settings)
+    for definition in integration_definitions(settings):
+        if definition.get("provider") != "nango":
             continue
-        store.upsert_connection(
-            client_id=client_id,
-            provider="nango",
-            integration_key=integration_key,
-            connection_id=connection.connection_id,
-            status=connection.status or "connected",
-            allowed_tools=CALENDAR_TOOL_NAMES,
-        )
-
-
-def _integration_status(settings, *, client_id: str) -> dict[str, Any]:
-    store = _integration_store(settings)
-    connections = store.list_connections(client_id=client_id)
-    if not connections:
-        integration_key = settings.integrations.nango_google_calendar_integration_id
-        connections = [
+        state = integration_state.get(definition["id"], {})
+        if not state.get("enabled"):
+            continue
+        integration_key = str(definition["integration_key"])
+        try:
+            connections = await nango.list_connections(client_id=client_id, integration_key=integration_key)
+        except NangoError:
+            continue
+        for connection in connections:
+            if not connection.connection_id:
+                continue
             store.upsert_connection(
                 client_id=client_id,
                 provider="nango",
                 integration_key=integration_key,
-                connection_id=None,
-                status="not_connected",
-                allowed_tools=CALENDAR_TOOL_NAMES,
+                connection_id=connection.connection_id,
+                status=connection.status or "connected",
+                allowed_tools=list(definition.get("allowed_tools") or []),
             )
-        ]
+
+
+def _integration_status(settings, *, client_id: str) -> dict[str, Any]:
+    client_config = _client_config(settings)
+    store = _integration_store(settings)
+    connections = store.list_connections(client_id=client_id)
     return {
         "client_id": client_id,
+        "cards": _integration_cards(settings, client_config=client_config, client_id=client_id),
         "integrations": [
             {
                 "provider": connection.provider,

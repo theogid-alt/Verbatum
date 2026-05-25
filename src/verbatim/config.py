@@ -196,11 +196,31 @@ class IntegrationConfig:
     nango_secret_key: str | None = None
     nango_api_base_url: str = "https://api.nango.dev"
     nango_google_calendar_integration_id: str = "google-calendar"
+    nango_calendly_integration_id: str = "calendly"
+    nango_salesforce_integration_id: str = "salesforce"
+    nango_hubspot_integration_id: str = "hubspot"
+    nango_pipedrive_integration_id: str = "pipedrive"
+    nango_slack_integration_id: str = "slack"
+    nango_gmail_integration_id: str = "gmail"
+    nango_outlook_calendar_integration_id: str = "outlook"
+    nango_google_sheets_integration_id: str = "google-sheets"
+    nango_airtable_integration_id: str = "airtable"
+    nango_notion_integration_id: str = "notion"
+    nango_stripe_integration_id: str = "stripe"
     twilio_account_sid: str | None = None
     twilio_auth_token: str | None = None
     twilio_from_number: str | None = None
     twilio_messaging_service_sid: str | None = None
     twilio_whatsapp_from: str | None = None
+    make_webhook_url: str | None = None
+    zapier_webhook_url: str | None = None
+    n8n_webhook_url: str | None = None
+    generic_webhook_url: str | None = None
+    zenchef_api_key: str | None = None
+    thefork_api_key: str | None = None
+    whatsapp_business_access_token: str | None = None
+    whatsapp_business_phone_number_id: str | None = None
+    stripe_api_key: str | None = None
     resend_api_key: str | None = None
     resend_from_email: str | None = None
     default_followup_phone: str | None = None
@@ -340,11 +360,44 @@ class Settings:
                     "google-calendar",
                 )
                 or "google-calendar",
+                nango_calendly_integration_id=_env(source, "NANGO_CALENDLY_INTEGRATION_ID", "calendly") or "calendly",
+                nango_salesforce_integration_id=_env(source, "NANGO_SALESFORCE_INTEGRATION_ID", "salesforce")
+                or "salesforce",
+                nango_hubspot_integration_id=_env(source, "NANGO_HUBSPOT_INTEGRATION_ID", "hubspot") or "hubspot",
+                nango_pipedrive_integration_id=_env(source, "NANGO_PIPEDRIVE_INTEGRATION_ID", "pipedrive")
+                or "pipedrive",
+                nango_slack_integration_id=_env(source, "NANGO_SLACK_INTEGRATION_ID", "slack") or "slack",
+                nango_gmail_integration_id=_env(source, "NANGO_GMAIL_INTEGRATION_ID", "gmail") or "gmail",
+                nango_outlook_calendar_integration_id=_env(
+                    source,
+                    "NANGO_OUTLOOK_CALENDAR_INTEGRATION_ID",
+                    "outlook",
+                )
+                or "outlook",
+                nango_google_sheets_integration_id=_env(
+                    source,
+                    "NANGO_GOOGLE_SHEETS_INTEGRATION_ID",
+                    "google-sheets",
+                )
+                or "google-sheets",
+                nango_airtable_integration_id=_env(source, "NANGO_AIRTABLE_INTEGRATION_ID", "airtable")
+                or "airtable",
+                nango_notion_integration_id=_env(source, "NANGO_NOTION_INTEGRATION_ID", "notion") or "notion",
+                nango_stripe_integration_id=_env(source, "NANGO_STRIPE_INTEGRATION_ID", "stripe") or "stripe",
                 twilio_account_sid=_env(source, "TWILIO_ACCOUNT_SID"),
                 twilio_auth_token=_env(source, "TWILIO_AUTH_TOKEN"),
                 twilio_from_number=_env(source, "TWILIO_FROM_NUMBER"),
                 twilio_messaging_service_sid=_env(source, "TWILIO_MESSAGING_SERVICE_SID"),
                 twilio_whatsapp_from=_env(source, "TWILIO_WHATSAPP_FROM"),
+                make_webhook_url=_env(source, "MAKE_WEBHOOK_URL"),
+                zapier_webhook_url=_env(source, "ZAPIER_WEBHOOK_URL"),
+                n8n_webhook_url=_env(source, "N8N_WEBHOOK_URL"),
+                generic_webhook_url=_env(source, "VERBATIM_WEBHOOK_URL"),
+                zenchef_api_key=_env(source, "ZENCHEF_API_KEY"),
+                thefork_api_key=_env(source, "THEFORK_API_KEY"),
+                whatsapp_business_access_token=_env(source, "WHATSAPP_BUSINESS_ACCESS_TOKEN"),
+                whatsapp_business_phone_number_id=_env(source, "WHATSAPP_BUSINESS_PHONE_NUMBER_ID"),
+                stripe_api_key=_env(source, "STRIPE_API_KEY"),
                 resend_api_key=_env(source, "RESEND_API_KEY"),
                 resend_from_email=_env(source, "RESEND_FROM_EMAIL"),
                 default_followup_phone=_env(source, "VERBATIM_DEFAULT_FOLLOWUP_PHONE"),

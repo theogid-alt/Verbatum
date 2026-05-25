@@ -74,7 +74,7 @@ def summarize_call_events(events: Iterable[dict[str, Any]], *, call_id: str | No
         "turns": turn_list[-80:],
         "client_event_counts": dict(client_counts),
         "tool_event_counts": dict(tool_counts),
-        "tool_call_count": tool_counts.get("tool.call.started", 0),
+        "tool_call_count": tool_counts.get("tool.call.started", 0) + tool_counts.get("tool.direct.activated", 0),
         "tool_failed_count": tool_counts.get("tool.call.failed", 0),
         "livekit_client_stats": latest_stats,
         **config,

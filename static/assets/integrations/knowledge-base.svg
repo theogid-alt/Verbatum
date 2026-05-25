@@ -1,0 +1,6 @@
+<svg role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+  <title>Knowledge Base</title>
+  <rect x="4" y="3" width="13" height="18" rx="2" fill="#155e88"/>
+  <path fill="#fff" d="M7 7h7v1.7H7V7Zm0 4h7v1.7H7V11Zm0 4h5v1.7H7V15Z"/>
+  <path fill="#9bd3ff" d="M17 6h2a1 1 0 0 1 1 1v12a2 2 0 0 1-2 2h-1V6Z"/>
+</svg>

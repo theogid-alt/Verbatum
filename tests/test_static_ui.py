@@ -58,6 +58,14 @@ def test_tools_controls_are_default_and_sent_to_agent_start():
     assert "Tool succeeded" in script
     assert "tool.call.completed" in script
     assert "state.config?.tools_enabled" in script
-    assert "direct_tools_configured" in script
+    assert "integrationCardsForTools" in script
+    assert "/api/client-config" in script
+    assert "/api/client-config/reset" in script
+    assert "resetClientKitButton" in script
+    assert "/api/evaluations/call" in script
+    assert "evaluateCallButton" in script
+    assert "saveEvaluationButton" in script
     assert "/api/integrations/nango/connect-session" in script
     assert 'type="checkbox"' in Path("static/index.html").read_text()
+    assert "Reset to Current Stack" in Path("static/index.html").read_text()
+    assert "Evaluate Current Call" in Path("static/index.html").read_text()

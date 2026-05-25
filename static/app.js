@@ -7,6 +7,8 @@ const state = {
   clientId: "demo",
   callerPhone: "",
   knowledgeBase: "",
+  systemPrompt: "",
+  clientConfig: null,
   toolsEnabled: true,
   integrationConnected: false,
   roomUrl: null,
@@ -32,6 +34,8 @@ const state = {
   config: null,
   metricsTimer: null,
   integrationPollTimer: null,
+  metricsCallId: null,
+  evaluationContext: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -45,11 +49,34 @@ const leaveButton = $("#leaveButton");
 const stopAgentButton = $("#stopAgentButton");
 const clientIdInput = $("#clientIdInput");
 const callerPhoneInput = $("#callerPhoneInput");
+const businessNameInput = $("#businessNameInput");
+const assistantNameInput = $("#assistantNameInput");
+const industryInput = $("#industryInput");
+const timezoneInput = $("#timezoneInput");
+const greetingInput = $("#greetingInput");
+const systemPromptInput = $("#systemPromptInput");
 const knowledgeBaseInput = $("#knowledgeBaseInput");
+const saveProfileButton = $("#saveProfileButton");
+const savePromptButton = $("#savePromptButton");
+const saveKbButton = $("#saveKbButton");
+const resetClientKitButton = $("#resetClientKitButton");
+const clientProfileLine = $("#clientProfileLine");
+const integrationCards = $("#integrationCards");
+const integrationCountLine = $("#integrationCountLine");
 const callNotesOutput = $("#callNotesOutput");
 const refreshCallNotesButton = $("#refreshCallNotesButton");
+const evaluateCallButton = $("#evaluateCallButton");
+const saveEvaluationButton = $("#saveEvaluationButton");
+const evaluationStatusLine = $("#evaluationStatusLine");
+const evaluationOverall = $("#evaluationOverall");
+const evaluationNeedsAttention = $("#evaluationNeedsAttention");
+const evaluationSavedState = $("#evaluationSavedState");
+const evaluationVersionInput = $("#evaluationVersionInput");
+const evaluationVersionSummary = $("#evaluationVersionSummary");
+const evaluationAutoMetrics = $("#evaluationAutoMetrics");
+const evaluationFields = $("#evaluationFields");
+const evaluationNotesInput = $("#evaluationNotesInput");
 const toolsEnabledInput = $("#toolsEnabledInput");
-const connectCalendarButton = $("#connectCalendarButton");
 const integrationStatusButton = $("#integrationStatusButton");
 const integrationStatusLine = $("#integrationStatusLine");
 const roomMount = $("#roomMount");
@@ -82,6 +109,19 @@ function ms(value) {
 async function postJson(url, payload = {}) {
   const response = await fetch(url, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.detail || `HTTP ${response.status}`);
+  }
+  return data;
+}
+
+async function putJson(url, payload = {}) {
+  const response = await fetch(url, {
+    method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
@@ -142,11 +182,9 @@ function renderControls() {
   llmButtons.querySelectorAll("button").forEach((button) => {
     if (state.transport === "hume_evi") button.disabled = true;
   });
-  const nangoConfigured = state.config?.integration_catalog?.providers?.some((provider) => provider.id === "nango" && provider.configured);
-  const directToolsConfigured = Boolean(state.config?.direct_tools_configured)
-    || state.config?.integration_catalog?.providers?.some((provider) => provider.id === "direct" && provider.configured);
+  const readyToolCards = integrationCardsForTools().filter((card) => card.enabled && card.ready);
   const toolsCompatible = state.transport !== "hume_evi" && state.llmProvider !== "ultravox";
-  const toolsReady = toolsCompatible && (directToolsConfigured || (nangoConfigured && state.integrationConnected));
+  const toolsReady = toolsCompatible && readyToolCards.length > 0;
   toolsEnabledInput.disabled = !toolsReady;
   if (!toolsReady) {
     toolsEnabledInput.checked = false;
@@ -155,7 +193,6 @@ function renderControls() {
     toolsEnabledInput.checked = true;
     state.toolsEnabled = true;
   }
-  connectCalendarButton.disabled = !nangoConfigured;
   prepareButton.textContent = state.transport === "hume_evi" ? "Create Hume Session" : "Create Room";
   startAgentButton.disabled = state.transport === "hume_evi" || !state.roomUrl;
   joinButton.disabled = !state.roomUrl && !state.humeSession;
@@ -173,6 +210,8 @@ function resetRoom(reason) {
   state.roomToken = null;
   state.callId = null;
   state.sessionId = null;
+  state.metricsCallId = null;
+  state.evaluationContext = null;
   state.humeSession = null;
   state.toolEventKeys.clear();
   roomUrl.value = "";
@@ -195,22 +234,46 @@ function escapeHtml(value) {
   })[char]);
 }
 
+function hydrateClientEditor() {
+  const profile = state.clientConfig?.profile || {};
+  clientIdInput.value = profile.profile_id || state.clientId || "demo";
+  businessNameInput.value = profile.business_name || "";
+  assistantNameInput.value = profile.assistant_name || "";
+  industryInput.value = profile.industry || "";
+  timezoneInput.value = profile.timezone || "";
+  greetingInput.value = profile.greeting || "";
+  systemPromptInput.value = state.systemPrompt || "";
+  knowledgeBaseInput.value = state.knowledgeBase || "";
+  clientProfileLine.textContent = `${profile.business_name || "Local client"} · ${profile.industry || "industry unset"} · ${profile.timezone || "timezone unset"}`;
+}
+
+function applyStackFromProfile(profile = {}) {
+  state.transport = profile.transport_provider || state.config?.transport_provider || state.transport || "livekit";
+  state.sttProvider = profile.stt_provider || state.config?.stt_provider || state.sttProvider || "deepgram";
+  state.sttModel = profile.deepgram_model || state.config?.stt_model || state.sttModel || "nova-3-general";
+  state.llmProvider = profile.llm_provider || state.config?.llm_provider || state.llmProvider || "groq";
+  state.llmModel = profile.llm_model || state.config?.llm_model || state.llmModel || "llama-3.1-8b-instant";
+}
+
 async function loadConfig() {
   const response = await fetch("/api/config");
   state.config = await response.json();
+  state.clientConfig = state.config.client_config || null;
   state.transport = state.config.transport_provider || "livekit";
   state.sttProvider = state.config.stt_provider || "deepgram";
   state.sttModel = state.config.stt_model || "nova-3-general";
   state.llmProvider = state.config.llm_provider || "groq";
   state.llmModel = state.config.llm_model || "llama-3.1-8b-instant";
+  applyStackFromProfile(state.clientConfig?.profile || {});
   state.clientId = state.config.default_client_id || "demo";
   state.callerPhone = state.config.caller_phone || "";
-  state.knowledgeBase = state.config.knowledge_base || "";
+  state.systemPrompt = state.clientConfig?.prompt?.content || "";
+  state.knowledgeBase = state.clientConfig?.knowledge_base?.content || state.config.knowledge_base || "";
   state.toolsEnabled = Boolean(state.config.tools_enabled);
-  clientIdInput.value = state.clientId;
+  hydrateClientEditor();
   callerPhoneInput.value = state.callerPhone;
-  knowledgeBaseInput.value = state.knowledgeBase;
   toolsEnabledInput.checked = state.toolsEnabled;
+  renderIntegrationCards();
   renderControls();
   refreshIntegrationStatus().catch(() => {});
   renderPlaceholder();
@@ -237,6 +300,7 @@ function requestPayload() {
     client_id: state.clientId,
     caller_phone: state.callerPhone,
     knowledge_base: state.knowledgeBase,
+    system_prompt: state.systemPrompt,
     tools_enabled: state.toolsEnabled && state.transport !== "hume_evi" && state.llmProvider !== "ultravox",
   };
 }
@@ -246,6 +310,7 @@ async function prepare() {
   if (state.transport === "hume_evi") {
     const session = await postJson("/api/hume/evi/session", {
       knowledge_base: state.knowledgeBase,
+      system_prompt: state.systemPrompt,
     });
     state.humeSession = session;
     state.roomUrl = session.chat_endpoint;
@@ -306,24 +371,38 @@ async function startAgent() {
 function syncToolStateFromInputs() {
   state.clientId = (clientIdInput.value || "demo").trim() || "demo";
   state.callerPhone = (callerPhoneInput.value || "").trim();
-  state.knowledgeBase = (knowledgeBaseInput.value || "").trim();
+  state.systemPrompt = state.clientConfig?.prompt?.content || state.systemPrompt || "";
+  state.knowledgeBase = state.clientConfig?.knowledge_base?.content || state.knowledgeBase || "";
   state.toolsEnabled = Boolean(toolsEnabledInput.checked);
 }
 
 async function connectCalendar() {
   syncToolStateFromInputs();
-  const integrationKey = currentCalendarIntegrationKey();
+  const card = integrationCardById("google_calendar") || { id: "google_calendar", integration_key: currentCalendarIntegrationKey(), label: "Google Calendar" };
+  return connectNangoIntegration(card);
+}
+
+async function connectNangoIntegration(card) {
+  syncToolStateFromInputs();
   const result = await postJson("/api/integrations/nango/connect-session", {
     client_id: state.clientId,
-    integration_key: integrationKey,
+    integration_id: card.id,
+    integration_key: card.integration_key,
   });
-  integrationStatusLine.textContent = `Calendar connect link expires ${result.expires_at || "soon"}`;
-  log("Calendar connect session created", {
+  integrationStatusLine.textContent = `${card.label} connect link expires ${result.expires_at || "soon"}`;
+  log("Nango connect session created", {
     client_id: result.client_id,
+    integration_id: result.integration_id,
     integration_key: result.integration_key,
   });
   window.open(result.connect_link, "_blank", "noopener");
   startIntegrationStatusPolling();
+}
+
+async function connectIntegration(integrationId) {
+  const card = integrationCardById(integrationId);
+  if (card?.provider === "nango") return connectNangoIntegration(card);
+  log("Integration connect unavailable", { integration_id: integrationId });
 }
 
 async function refreshIntegrationStatus() {
@@ -331,24 +410,19 @@ async function refreshIntegrationStatus() {
   const response = await fetch(`/api/integrations/status?client_id=${encodeURIComponent(state.clientId)}`);
   const status = await response.json();
   if (!response.ok) throw new Error(status.detail || `HTTP ${response.status}`);
-  const integrationKey = currentCalendarIntegrationKey();
-  const calendar = (status.integrations || []).find((item) => item.integration_key === integrationKey) || status.integrations?.[0];
-  const directToolsConfigured = Boolean(state.config?.direct_tools_configured)
-    || state.config?.integration_catalog?.providers?.some((provider) => provider.id === "direct" && provider.configured);
-  state.integrationConnected = Boolean(calendar?.connection_id && !["not_connected", "pending", "error", "failed", "expired"].includes(String(calendar.status || "").toLowerCase()));
-  if ((state.integrationConnected || directToolsConfigured) && state.config?.tools_enabled && state.transport !== "hume_evi" && state.llmProvider !== "ultravox") {
+  if (status.cards) {
+    state.config.integration_catalog.cards = status.cards;
+  }
+  renderIntegrationCards();
+  state.integrationConnected = allIntegrationCards().some((card) => card.provider === "nango" && card.enabled && card.ready);
+  const readyToolCards = integrationCardsForTools().filter((card) => card.enabled && card.ready);
+  if (readyToolCards.length && state.config?.tools_enabled && state.transport !== "hume_evi" && state.llmProvider !== "ultravox") {
     state.toolsEnabled = true;
     toolsEnabledInput.checked = true;
   }
-  integrationStatusLine.textContent = calendar
-    ? state.integrationConnected
-      ? `${calendar.integration_key}: connected`
-      : directToolsConfigured
-        ? `${calendar.integration_key}: not connected · direct follow-up tools ready`
-        : `${calendar.integration_key}: not connected. Connect Calendar before enabling tools.`
-    : directToolsConfigured
-      ? "Direct follow-up tools ready"
-      : "No integrations configured";
+  integrationStatusLine.textContent = readyToolCards.length
+    ? `Ready tools: ${readyToolCards.map((card) => card.label).join(", ")}`
+    : "No enabled integrations are ready yet.";
   renderControls();
   if (state.integrationConnected) stopIntegrationStatusPolling();
   return status;
@@ -357,7 +431,7 @@ async function refreshIntegrationStatus() {
 function startIntegrationStatusPolling() {
   stopIntegrationStatusPolling();
   let attempts = 0;
-  integrationStatusLine.textContent = "Waiting for calendar connection...";
+  integrationStatusLine.textContent = "Waiting for integration connection...";
   state.integrationPollTimer = window.setInterval(() => {
     attempts += 1;
     refreshIntegrationStatus().catch((error) => {
@@ -366,7 +440,7 @@ function startIntegrationStatusPolling() {
     if (attempts >= 40) {
       stopIntegrationStatusPolling();
       if (!state.integrationConnected) {
-        integrationStatusLine.textContent = "Calendar still not connected. Finish Nango auth, then click Status.";
+        integrationStatusLine.textContent = "Integration still not connected. Finish Nango auth, then click Status.";
       }
     }
   }, 3000);
@@ -380,7 +454,183 @@ function stopIntegrationStatusPolling() {
 }
 
 function currentCalendarIntegrationKey() {
-  return state.config?.integration_catalog?.providers?.[0]?.integrations?.[0]?.integration_key || "google-calendar";
+  return integrationCardById("google_calendar")?.integration_key || "google-calendar";
+}
+
+function allIntegrationCards() {
+  return state.config?.integration_catalog?.cards || [];
+}
+
+function integrationCardById(integrationId) {
+  return allIntegrationCards().find((card) => card.id === integrationId);
+}
+
+function integrationCardsForTools() {
+  return allIntegrationCards().filter((card) => Array.isArray(card.allowed_tools) && card.allowed_tools.length);
+}
+
+function renderIntegrationCards() {
+  if (!integrationCards) return;
+  const cards = allIntegrationCards();
+  const readyCount = cards.filter((card) => card.enabled && card.ready).length;
+  integrationCountLine.textContent = `${readyCount} ready · ${cards.length} slots`;
+  integrationCards.innerHTML = "";
+  cards.forEach((card) => {
+    const element = document.createElement("article");
+    element.className = `integration-card ${card.enabled ? "" : "disabled"}`;
+    const logoFallback = (card.label || "?").split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase();
+    const envText = card.missing_env?.length ? `Needs: ${card.missing_env.join(", ")}` : (card.required_env?.length ? `Env: ${card.required_env.join(", ")}` : "");
+    element.innerHTML = `
+      <div class="integration-top">
+        <div class="integration-logo">
+          <img src="${escapeHtml(card.logo_path || "")}" alt="" onerror="this.replaceWith(Object.assign(document.createElement('span'), {textContent: '${escapeHtml(logoFallback)}'}))" />
+        </div>
+        <div class="integration-title">
+          <strong>${escapeHtml(card.label)}</strong>
+          <span>${escapeHtml(card.status_label || card.status)}</span>
+        </div>
+      </div>
+      <p>${escapeHtml(card.description || "")}</p>
+      <div class="integration-env">${escapeHtml(envText)}</div>
+      <div class="integration-actions"></div>
+    `;
+    const actions = element.querySelector(".integration-actions");
+    if (card.implemented) {
+      if (card.provider === "nango" && card.enabled && !card.ready && card.status !== "missing_env") {
+        actions.appendChild(cardButton("Connect", () => connectIntegration(card.id)));
+      }
+      actions.appendChild(cardButton("Test", () => testIntegration(card.id), !card.enabled));
+      actions.appendChild(cardButton(card.enabled ? "Disconnect" : "Enable", () => {
+        if (card.enabled) {
+          disconnectIntegration(card.id);
+        } else {
+          setIntegrationEnabled(card.id, true);
+        }
+      }));
+    } else {
+      actions.appendChild(cardButton("Coming soon", () => {}, true));
+    }
+    integrationCards.appendChild(element);
+  });
+}
+
+function cardButton(label, onClick, disabled = false) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.disabled = disabled;
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+async function reloadClientConfig() {
+  const response = await fetch("/api/client-config");
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+  state.clientConfig = data;
+  state.config.client_config = data;
+  state.config.integration_catalog = data.integration_catalog;
+  state.clientId = data.profile?.profile_id || state.clientId;
+  state.systemPrompt = data.prompt?.content || "";
+  state.knowledgeBase = data.knowledge_base?.content || "";
+  hydrateClientEditor();
+  renderIntegrationCards();
+  renderControls();
+  return data;
+}
+
+async function saveProfile() {
+  const payload = {
+    business_name: businessNameInput.value,
+    assistant_name: assistantNameInput.value,
+    industry: industryInput.value,
+    timezone: timezoneInput.value,
+    greeting: greetingInput.value,
+    transport_provider: state.transport,
+    stt_provider: state.sttProvider,
+    deepgram_model: state.sttModel,
+    llm_provider: state.llmProvider,
+    llm_model: state.llmModel,
+  };
+  const data = await putJson("/api/client-config/profile", payload);
+  state.clientConfig = data;
+  state.config.client_config = data;
+  state.config.integration_catalog = data.integration_catalog;
+  state.clientId = data.profile?.profile_id || state.clientId;
+  hydrateClientEditor();
+  renderIntegrationCards();
+  log("Client profile saved", { business: payload.business_name, stack: `${state.transport}/${state.sttModel}/${state.llmProvider}` });
+}
+
+async function savePrompt() {
+  const data = await putJson("/api/client-config/prompt", { content: systemPromptInput.value });
+  state.clientConfig = data;
+  state.config.client_config = data;
+  state.systemPrompt = data.prompt?.content || "";
+  hydrateClientEditor();
+  log("Prompt saved", { chars: state.systemPrompt.length });
+}
+
+async function saveKb() {
+  const data = await putJson("/api/client-config/kb", { content: knowledgeBaseInput.value });
+  state.clientConfig = data;
+  state.config.client_config = data;
+  state.knowledgeBase = data.knowledge_base?.content || "";
+  hydrateClientEditor();
+  log("Knowledge base saved", { chars: state.knowledgeBase.length });
+}
+
+async function resetClientKit() {
+  if (!window.confirm("Reset the client profile, system prompt, and persistent KB to the current baseline? Integrations stay connected.")) {
+    return;
+  }
+  const data = await postJson("/api/client-config/reset", {});
+  state.clientConfig = data;
+  state.config.client_config = data;
+  state.config.integration_catalog = data.integration_catalog;
+  state.systemPrompt = data.prompt?.content || "";
+  state.knowledgeBase = data.knowledge_base?.content || "";
+  applyStackFromProfile(data.profile || {});
+  hydrateClientEditor();
+  renderIntegrationCards();
+  renderControls();
+  log("Client kit reset", {
+    stack: `${state.transport}/${state.sttModel}/${state.llmProvider}/${state.llmModel}`,
+    prompt_chars: state.systemPrompt.length,
+    kb_chars: state.knowledgeBase.length,
+  });
+}
+
+async function setIntegrationEnabled(integrationId, enabled) {
+  const data = await putJson("/api/client-config/integrations", {
+    integrations: { [integrationId]: { enabled } },
+  });
+  state.clientConfig = data;
+  state.config.client_config = data;
+  state.config.integration_catalog = data.integration_catalog;
+  renderIntegrationCards();
+  renderControls();
+  log("Integration updated", { integration_id: integrationId, enabled });
+}
+
+async function disconnectIntegration(integrationId) {
+  const data = await postJson(`/api/integrations/${encodeURIComponent(integrationId)}/disconnect`, {});
+  state.clientConfig = data;
+  state.config.client_config = data;
+  state.config.integration_catalog = data.integration_catalog;
+  renderIntegrationCards();
+  renderControls();
+  log("Integration disconnected", { integration_id: integrationId });
+}
+
+async function testIntegration(integrationId) {
+  const result = await postJson(`/api/integrations/${encodeURIComponent(integrationId)}/test`, {});
+  log(result.ok ? "Integration test passed" : "Integration test failed", {
+    integration_id: integrationId,
+    status: result.status,
+    message: result.message,
+  });
+  integrationStatusLine.textContent = result.message || result.status || "Integration test complete";
 }
 
 async function join() {
@@ -773,6 +1023,7 @@ async function refreshMetrics() {
       : "/api/analytics/summary";
     const summary = await fetch(summaryUrl).then((response) => response.json());
     const metricsCallId = state.callId || summary.latest_call_id || summary.call_id;
+    state.metricsCallId = metricsCallId || null;
     const transcript = metricsCallId
       ? await fetch(`/api/analytics/transcript?call_id=${encodeURIComponent(metricsCallId)}`).then((response) => response.json())
       : { items: [] };
@@ -813,18 +1064,207 @@ function renderCallNotes(notes) {
   callNotesOutput.textContent = notes.notes_text || "Call notes will appear here after the call.";
 }
 
+async function evaluateCurrentCall() {
+  const callId = state.callId || state.metricsCallId;
+  if (!callId) {
+    log("Evaluation skipped", { reason: "No call_id available" });
+    evaluationStatusLine.textContent = "Create or select a call before evaluating.";
+    return;
+  }
+  const botVersion = sanitizeBotVersion(evaluationVersionInput?.value || "v01");
+  const context = await fetch(`/api/evaluations/call?call_id=${encodeURIComponent(callId)}&bot_version=${encodeURIComponent(botVersion)}`).then((response) => response.json());
+  state.evaluationContext = context;
+  renderEvaluationContext(context);
+  await refreshEvaluationVersionSummary();
+  log("Evaluation loaded", {
+    call_id: context.call_id,
+    bot_version: context.bot_version,
+    saved: Boolean(context.saved_evaluation),
+  });
+}
+
+function renderEvaluationContext(context) {
+  const saved = context.saved_evaluation || null;
+  const summary = saved?.score_summary || {};
+  const botVersion = saved?.bot_version || context.bot_version || sanitizeBotVersion(evaluationVersionInput?.value || "v01");
+  if (evaluationVersionInput) evaluationVersionInput.value = botVersion;
+  evaluationStatusLine.textContent = `Call ${context.call_id || "n/a"} · ${botVersion} · ${context.transcript?.length || 0} transcript items · ${context.call_notes?.status || "waiting"}`;
+  evaluationSavedState.textContent = saved ? "Yes" : "No";
+  evaluationOverall.textContent = summary.overall_average ?? "n/a";
+  evaluationNeedsAttention.textContent = String(summary.needs_attention?.length || 0);
+  evaluationNotesInput.value = saved?.reviewer_notes || "";
+  renderEvaluationAutoMetrics({ ...(saved?.auto_metrics || {}), ...(context.auto_metrics || {}) });
+  renderEvaluationFields(context.rubric || {}, saved?.scores || {});
+  saveEvaluationButton.disabled = !context.call_id;
+  updateEvaluationPreview();
+}
+
+function renderEvaluationAutoMetrics(metrics) {
+  const stats = metrics.livekit_client_stats || {};
+  const cards = [
+    ["Avg", ms(metrics.avg_perceived_latency_ms)],
+    ["P95", ms(metrics.p95_perceived_latency_ms)],
+    ["Max", ms(metrics.max_perceived_latency_ms)],
+    ["STT avg", ms(metrics.avg_stt_processing_ms ?? metrics.avg_speech_to_transcript_ms)],
+    ["STT p95", ms(metrics.p95_stt_processing_ms ?? metrics.p95_speech_to_transcript_ms)],
+    ["TTFT avg", ms(metrics.avg_provider_ttft_ms)],
+    ["TTFT p95", ms(metrics.p95_provider_ttft_ms)],
+    ["TTS avg", ms(metrics.avg_tts_first_audio_ms)],
+    ["TTS p95", ms(metrics.p95_tts_first_audio_ms)],
+    ["Playback", ms(metrics.avg_playback_delay_ms)],
+    ["Transcript→LLM", ms(metrics.avg_transcript_to_llm_ms)],
+    ["Tools", `${metrics.tool_call_count || 0} calls · ${metrics.tool_failed_count || 0} failed`],
+    ["Network", stats.connection_state ? `${stats.inbound_packet_loss_pct ?? "n/a"}% loss · ${stats.jitter_ms ?? "n/a"}ms jitter` : "n/a"],
+  ];
+  evaluationAutoMetrics.innerHTML = cards.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
+}
+
+function renderEvaluationFields(rubric, savedScores) {
+  const fields = rubric.fields || [];
+  evaluationFields.innerHTML = "";
+  fields.forEach((field) => {
+    const saved = savedScores[field.id] || {};
+    const article = document.createElement("article");
+    article.className = "evaluation-field";
+    article.dataset.evalField = field.id;
+    article.innerHTML = `
+      <label>${escapeHtml(field.label)}</label>
+      <p>${escapeHtml(field.description || "")}</p>
+      <select data-eval-score="${escapeHtml(field.id)}">
+        <option value="">Score 1-5</option>
+        <option value="5">5 · Excellent</option>
+        <option value="4">4 · Good</option>
+        <option value="3">3 · Usable</option>
+        <option value="2">2 · Needs attention</option>
+        <option value="1">1 · Failed</option>
+      </select>
+      <textarea rows="2" data-eval-note="${escapeHtml(field.id)}" placeholder="Optional note for ${escapeHtml(field.label)}"></textarea>
+    `;
+    const select = article.querySelector("select");
+    const note = article.querySelector("textarea");
+    select.value = saved.score ? String(saved.score) : "";
+    note.value = saved.notes || "";
+    select.addEventListener("change", updateEvaluationPreview);
+    note.addEventListener("input", updateEvaluationPreview);
+    evaluationFields.appendChild(article);
+  });
+}
+
+function evaluationPayloadFromForm() {
+  const scores = {};
+  evaluationFields.querySelectorAll("[data-eval-field]").forEach((field) => {
+    const fieldId = field.dataset.evalField;
+    const score = field.querySelector(`[data-eval-score="${CSS.escape(fieldId)}"]`)?.value || null;
+    const notes = field.querySelector(`[data-eval-note="${CSS.escape(fieldId)}"]`)?.value || "";
+    scores[fieldId] = { score, notes };
+  });
+  return {
+    bot_version: sanitizeBotVersion(evaluationVersionInput?.value || "v01"),
+    scores,
+    reviewer_notes: evaluationNotesInput.value || "",
+  };
+}
+
+function updateEvaluationPreview() {
+  const values = Object.values(evaluationPayloadFromForm().scores)
+    .map((item) => Number(item.score))
+    .filter((score) => Number.isFinite(score) && score > 0);
+  const needsAttention = values.filter((score) => score <= 2).length;
+  evaluationOverall.textContent = values.length ? (values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2) : "n/a";
+  evaluationNeedsAttention.textContent = String(needsAttention);
+}
+
+async function saveEvaluation() {
+  const callId = state.evaluationContext?.call_id || state.callId || state.metricsCallId;
+  if (!callId) {
+    throw new Error("No call_id available for evaluation.");
+  }
+  const report = await putJson(`/api/evaluations/call/${encodeURIComponent(callId)}`, evaluationPayloadFromForm());
+  state.evaluationContext = {
+    ...(state.evaluationContext || {}),
+    call_id: callId,
+    bot_version: report.bot_version,
+    saved_evaluation: report,
+  };
+  evaluationSavedState.textContent = "Yes";
+  evaluationStatusLine.textContent = `Saved evaluation for ${callId} · ${report.bot_version || "v01"}`;
+  await refreshEvaluationVersionSummary();
+  log("Evaluation saved", {
+    call_id: callId,
+    bot_version: report.bot_version,
+    overall_average: report.score_summary?.overall_average ?? null,
+    needs_attention: report.score_summary?.needs_attention?.length || 0,
+  });
+}
+
+async function refreshEvaluationVersionSummary() {
+  if (!evaluationVersionSummary) return;
+  try {
+    const summary = await fetch("/api/evaluations/summary").then((response) => response.json());
+    const version = sanitizeBotVersion(evaluationVersionInput?.value || "v01");
+    const selected = (summary.versions || []).find((item) => item.bot_version === version);
+    if (!selected) {
+      evaluationVersionSummary.textContent = `${version}: no saved evaluations yet`;
+      return;
+    }
+    const domainText = Object.entries(selected.domain_averages || {})
+      .slice(0, 5)
+      .map(([key, value]) => `${key} ${value ?? "n/a"}`)
+      .join(" · ");
+    evaluationVersionSummary.textContent = `${version}: ${selected.evaluation_count} evals · avg ${selected.overall_average ?? "n/a"}${domainText ? ` · ${domainText}` : ""}`;
+  } catch (error) {
+    evaluationVersionSummary.textContent = `Evaluation summary unavailable: ${error.message}`;
+  }
+}
+
+function sanitizeBotVersion(value) {
+  const cleaned = String(value || "v01").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[-._]+|[-._]+$/g, "");
+  return cleaned || "v01";
+}
+
 function renderToolTerminalEvents(events) {
   events.forEach((event) => {
     const eventName = String(event.event_name || "").replaceAll("_", ".");
-    if (!["tool.call.started", "tool.call.completed", "tool.call.failed"].includes(eventName)) return;
+    const visibleToolEvents = [
+      "tool.call.started",
+      "tool.call.completed",
+      "tool.call.failed",
+      "tool.confirmation.required",
+      "tool.confirmation.accepted",
+      "tool.confirmation.rejected",
+      "tool.direct.activated",
+      "tool.direct.skipped",
+    ];
+    if (!visibleToolEvents.includes(eventName)) return;
     const metadata = event.metadata || {};
     const toolName = metadata.tool_name || "tool";
     const outcome = metadata.outcome || (eventName.endsWith(".started") ? "started" : "");
     const key = `${event.timestamp_wall_iso}|${eventName}|${toolName}|${outcome}`;
     if (state.toolEventKeys.has(key)) return;
     state.toolEventKeys.add(key);
+    const facts = compactToolFacts(metadata);
+    if (eventName === "tool.direct.activated") {
+      log("Tool direct action", { tool: toolName, ...facts });
+      return;
+    }
+    if (eventName === "tool.direct.skipped") {
+      log("Tool skipped", { tool: toolName, outcome, ...facts });
+      return;
+    }
     if (eventName === "tool.call.started") {
       log("Tool started", { tool: toolName });
+      return;
+    }
+    if (eventName === "tool.confirmation.required") {
+      log("Tool confirmation required", { tool: toolName, outcome, ...facts });
+      return;
+    }
+    if (eventName === "tool.confirmation.accepted" || eventName === "tool.confirmation.rejected") {
+      log(eventName.endsWith(".accepted") ? "Tool confirmation accepted" : "Tool confirmation rejected", {
+        tool: toolName,
+        outcome,
+        ...facts,
+      });
       return;
     }
     if (eventName === "tool.call.completed") {
@@ -835,6 +1275,7 @@ function renderToolTerminalEvents(events) {
         tool: toolName,
         outcome,
         duration_ms: metadata.duration_ms ?? null,
+        ...facts,
       });
       return;
     }
@@ -842,8 +1283,34 @@ function renderToolTerminalEvents(events) {
       tool: toolName,
       outcome,
       duration_ms: metadata.duration_ms ?? null,
+      ...facts,
     });
   });
+}
+
+function compactToolFacts(metadata) {
+  const keys = [
+    "ok",
+    "booking_booked",
+    "booking_prepared",
+    "booking_cancelled",
+    "calendar_checked",
+    "calendar_has_conflict",
+    "sms_sent",
+    "email_sent",
+    "to_phone",
+    "destination_preview",
+    "start_iso",
+    "end_iso",
+    "suggested_slot_count",
+    "message_id",
+  ];
+  return keys.reduce((result, key) => {
+    if (metadata[key] !== undefined && metadata[key] !== null && metadata[key] !== "") {
+      result[key] = metadata[key];
+    }
+    return result;
+  }, {});
 }
 
 function renderTranscript(items) {
@@ -892,21 +1359,43 @@ callerPhoneInput.addEventListener("change", () => {
 });
 
 knowledgeBaseInput.addEventListener("change", () => {
-  syncToolStateFromInputs();
-  log("Call KB updated", { chars: state.knowledgeBase.length });
+  log("Knowledge base edited", { unsaved: true, chars: (knowledgeBaseInput.value || "").length });
 });
 
+systemPromptInput.addEventListener("change", () => {
+  log("Prompt edited", { unsaved: true, chars: (systemPromptInput.value || "").length });
+});
+
+saveProfileButton.addEventListener("click", () => saveProfile().catch((error) => log("Profile save failed", { error: error.message })));
+
+savePromptButton.addEventListener("click", () => savePrompt().catch((error) => log("Prompt save failed", { error: error.message })));
+
+saveKbButton.addEventListener("click", () => saveKb().catch((error) => log("Knowledge base save failed", { error: error.message })));
+
+resetClientKitButton.addEventListener("click", () => resetClientKit().catch((error) => log("Client kit reset failed", { error: error.message })));
+
 refreshCallNotesButton.addEventListener("click", () => refreshMetrics().catch((error) => log("Call notes refresh failed", { error: error.message })));
+
+evaluateCallButton.addEventListener("click", () => evaluateCurrentCall().catch((error) => {
+  evaluationStatusLine.textContent = error.message;
+  log("Evaluation load failed", { error: error.message });
+}));
+
+saveEvaluationButton.addEventListener("click", () => saveEvaluation().catch((error) => {
+  evaluationStatusLine.textContent = error.message;
+  log("Evaluation save failed", { error: error.message });
+}));
+
+evaluationNotesInput.addEventListener("input", updateEvaluationPreview);
+evaluationVersionInput.addEventListener("change", () => {
+  evaluationVersionInput.value = sanitizeBotVersion(evaluationVersionInput.value || "v01");
+  refreshEvaluationVersionSummary();
+});
 
 toolsEnabledInput.addEventListener("change", () => {
   syncToolStateFromInputs();
   log("Tools toggled", { client_id: state.clientId, tools_enabled: state.toolsEnabled });
 });
-
-connectCalendarButton.addEventListener("click", () => connectCalendar().catch((error) => {
-  log("Calendar connect failed", { error: error.message });
-  integrationStatusLine.textContent = error.message;
-}));
 
 integrationStatusButton.addEventListener("click", () => refreshIntegrationStatus().catch((error) => {
   log("Integration status failed", { error: error.message });

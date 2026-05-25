@@ -93,6 +93,16 @@ def test_latency_summary_prefers_transcript_stt_processing_metadata():
     assert summary["avg_stt_processing_ms"] == 180.4
 
 
+def test_latency_summary_counts_direct_tool_actions_as_tool_calls():
+    tool = event("call_a", "turn_0001", "tool.direct.activated", 1000)
+    tool["metadata"] = {"tool_name": "check_calendar_conflict", "outcome": "started"}
+
+    summary = summarize_call_events([tool], call_id="call_a")
+
+    assert summary["tool_call_count"] == 1
+    assert summary["tool_event_counts"]["tool.direct.activated"] == 1
+
+
 def test_call_notes_are_generated_from_transcript_and_tool_events():
     user = event("call_a", "turn_0001", "transcript.user", 1000)
     user["metadata"] = {"text": "Can you book Friday at 2?"}

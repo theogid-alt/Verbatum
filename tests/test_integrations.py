@@ -11,6 +11,7 @@ from verbatim.integrations.tools import (
     _accepts_suggested_slot,
     _booking_status_response,
     _calendar_action_from_text,
+    _asks_sms_status,
     _calendar_response_text,
     _extract_phone,
     _extract_phone_fragment,
@@ -23,6 +24,7 @@ from verbatim.integrations.tools import (
     _validate_phone,
     SchedulingToolRuntime,
     build_scheduling_tools_schema,
+    scheduling_tools_ready,
 )
 
 
@@ -215,6 +217,26 @@ def test_booking_does_not_write_when_calendar_time_is_busy(tmp_path):
     assert len(nango.created) == 0
 
 
+def test_calendar_tools_ready_accepts_nango_error_status_with_connection_id(tmp_path):
+    settings = Settings.from_env(
+        {
+            "NANGO_SECRET_KEY": "nango-secret",
+            "VERBATIM_INTEGRATIONS_DB_PATH": str(tmp_path / "integrations.db"),
+        }
+    )
+    store = IntegrationStore(settings.integrations.integrations_db_path)
+    store.upsert_connection(
+        client_id="client-a",
+        provider="nango",
+        integration_key=settings.integrations.nango_google_calendar_integration_id,
+        connection_id="calendar_conn",
+        status="error",
+        allowed_tools=CALENDAR_TOOL_NAMES,
+    )
+
+    assert scheduling_tools_ready(settings, client_id="client-a") is True
+
+
 def test_cancel_confirmed_booking_deletes_once(tmp_path):
     store = IntegrationStore(tmp_path / "integrations.db")
     store.upsert_connection(
@@ -342,6 +364,45 @@ def test_sms_tool_uses_simulated_caller_phone_and_ignores_llm_number():
     assert result["outcome"] == "sms_sent"
     assert result["destination_preview"] == "***6987"
     assert route.called
+
+
+@respx.mock
+def test_sms_tool_emits_terminal_safe_result_facts():
+    settings = Settings.from_env(
+        {
+            "TWILIO_ACCOUNT_SID": "AC123",
+            "TWILIO_AUTH_TOKEN": "auth-secret",
+            "TWILIO_FROM_NUMBER": "+15550000000",
+        }
+    )
+    respx.post("https://api.twilio.com/2010-04-01/Accounts/AC123/Messages.json").mock(
+        return_value=httpx.Response(201, json={"sid": "SM123"})
+    )
+
+    class Recorder:
+        def __init__(self):
+            self.events = []
+
+        def emit(self, event_name, **kwargs):
+            self.events.append({"event_name": event_name, **kwargs})
+
+    recorder = Recorder()
+    runtime = SchedulingToolRuntime(
+        settings=settings,
+        client_id="client-a",
+        recorder=recorder,
+        caller_phone="+33686306987",
+    )
+
+    result = asyncio.run(runtime.run_tool("send_sms_followup", {"body": "Viewing confirmed.", "channel": "sms"}))
+
+    assert result["ok"] is True
+    completed = [event for event in recorder.events if event["event_name"] == "tool.call.completed"][-1]
+    metadata = completed["metadata"]
+    assert metadata["sms_sent"] is True
+    assert metadata["to_phone"] == "+33686306987"
+    assert metadata["destination_preview"] == "***6987"
+    assert "auth-secret" not in str(completed)
 
 
 @respx.mock
@@ -482,24 +543,24 @@ def test_calendar_action_combines_split_booking_turns():
 
 def test_calendar_action_parses_flux_spoken_may_date_and_word_time():
     action = _calendar_action_from_text(
-        latest_text="Uh, the twenty third of May at seven PM.",
-        recent_text="Let's book a meeting on the twenty third. Uh, the twenty third of May at seven PM.",
+        latest_text="Uh, the twenty sixth of June at seven PM.",
+        recent_text="Let's book a meeting on the twenty sixth. Uh, the twenty sixth of June at seven PM.",
     )
 
     assert action
     assert action["tool_name"] == "prepare_and_confirm_calendar_booking"
-    assert "2026-05-23T19:00:00" in action["arguments"]["start_iso"]
+    assert "2026-06-26T19:00:00" in action["arguments"]["start_iso"]
 
 
 def test_calendar_action_uses_prior_spoken_date_when_latest_supplies_word_time():
     action = _calendar_action_from_text(
         latest_text="Friday, seven PM.",
-        recent_text="Let's book a meeting on the twenty third of May. Friday, seven PM.",
+        recent_text="Let's book a meeting on the twenty sixth of June. Friday, seven PM.",
     )
 
     assert action
     assert action["tool_name"] == "prepare_and_confirm_calendar_booking"
-    assert "2026-05-23T19:00:00" in action["arguments"]["start_iso"]
+    assert "2026-06-26T19:00:00" in action["arguments"]["start_iso"]
 
 
 def test_spoken_time_parser_handles_word_meridiem():
@@ -643,6 +704,62 @@ def test_calendar_action_treats_booking_status_as_status_not_new_booking():
     )
 
     assert action is None
+
+
+def test_calendar_action_prioritizes_explicit_booking_over_stale_availability_context():
+    action = _calendar_action_from_text(
+        latest_text="Can you book a viewing tomorrow at 7:30 PM?",
+        recent_text="Are you free tomorrow at 7:30 PM? Can you book a viewing tomorrow at 7:30 PM?",
+    )
+
+    assert action
+    assert action["tool_name"] == "prepare_and_confirm_calendar_booking"
+    assert "T19:30:00" in action["arguments"]["start_iso"]
+
+
+def test_calendar_action_handles_stuttered_viewing_time_request():
+    action = _calendar_action_from_text(
+        latest_text="Three bedroom villa, please. Could could we do it tomorrow around 7:30 PM?",
+        recent_text="Three bedroom villa, please. Could could we do it tomorrow around 7:30 PM?",
+    )
+
+    assert action
+    assert action["tool_name"] == "check_calendar_conflict"
+    assert "T19:30:00" in action["arguments"]["start_iso"]
+
+
+def test_calendar_action_treats_calendar_status_questions_as_status():
+    assert _calendar_action_from_text(
+        latest_text="What about the booking? The booking does not seem like it was booked.",
+        recent_text="Are you free tomorrow at 7:30 PM?",
+    ) is None
+    assert _calendar_action_from_text(
+        latest_text="Is it on the Google Calendar?",
+        recent_text="Are you free tomorrow at 7:30 PM?",
+    ) is None
+
+
+def test_booking_status_and_suggested_slot_acceptance_cover_natural_confirmations():
+    action = _suggested_booking_action(
+        {
+            "suggested_slots": [
+                {"start_iso": "2026-05-30T09:00:00+02:00", "end_iso": "2026-05-30T09:30:00+02:00"}
+            ]
+        }
+    )
+
+    assert _accepts_suggested_slot("That's amazing.", recent_tail="Yes, tomorrow is open.")
+    assert _accepts_suggested_slot("Perfect.", recent_tail="I can do this slot.")
+    assert _booking_status_response(
+        "What about the booking? It does not seem like it was booked.",
+        last_booking_response=None,
+        last_suggested_action=action,
+    ).startswith("Not yet.")
+
+
+def test_sms_status_questions_are_tool_turns_not_llm_promises():
+    assert _asks_sms_status("Did you send it to me?")
+    assert _asks_sms_status("I still haven't received any confirmation message.")
 
 
 def test_calendar_response_suggests_next_slot_on_conflict():

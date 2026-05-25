@@ -24,6 +24,8 @@ class AgentSession:
     client_id: str | None = None
     caller_phone: str | None = None
     knowledge_base: str | None = None
+    system_prompt: str | None = None
+    enabled_tools: list[str] | None = None
     tools_enabled: bool = False
 
 
@@ -40,10 +42,7 @@ def _session_system_prompt(base_prompt: str, session: AgentSession) -> str:
 
 
 def _session_context_messages(base_prompt: str, session: AgentSession) -> list[dict[str, str]]:
-    call_context = _session_call_context_prompt(session)
-    if call_context:
-        return [{"role": "system", "content": call_context}]
-    return [{"role": "system", "content": base_prompt}]
+    return [{"role": "system", "content": _session_system_prompt(base_prompt, session)}]
 
 
 def _session_call_context_prompt(session: AgentSession) -> str | None:
@@ -306,7 +305,7 @@ async def _run_cascade_pipeline(settings, session, recorder, Pipeline, PipelineR
     stt = _build_stt(settings)
     llm = _build_llm(settings, recorder)
     tts = _build_tts(settings, recorder, CartesiaTTSService, TextAggregationMode)
-    context = LLMContext(messages=_session_context_messages(settings.prompt.system_prompt, session))
+    context = LLMContext(messages=_session_context_messages(session.system_prompt or settings.prompt.system_prompt, session))
     tools_schema = None
     if session.tools_enabled:
         from verbatim.integrations.tools import configure_scheduling_tools
