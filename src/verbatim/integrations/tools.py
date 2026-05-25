@@ -151,6 +151,13 @@ class SchedulingToolRuntime:
         self.followup = FollowupService(settings=settings, client_id=client_id)
         self.timeout_secs = max(settings.integrations.tool_timeout_ms, 1) / 1000
 
+    def _timeout_for(self, tool_name: str) -> float:
+        if tool_name in {"confirm_calendar_booking", "cancel_calendar_booking"}:
+            return max(self.timeout_secs, 4.5)
+        if tool_name == "send_sms_followup":
+            return max(self.timeout_secs, 4.0)
+        return self.timeout_secs
+
     def register(self, llm: Any, context: Any, *, expose_context_tools: bool = False) -> Any | None:
         if not hasattr(llm, "register_function"):
             self._emit(
@@ -188,6 +195,7 @@ class SchedulingToolRuntime:
 
     async def _run_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         started = time.monotonic()
+        timeout_secs = self._timeout_for(tool_name)
         self._emit("tool.call.started", tool_name=tool_name, outcome="started")
         try:
             if tool_name not in self.enabled_tools:
@@ -199,7 +207,7 @@ class SchedulingToolRuntime:
                         timezone=str(arguments.get("timezone") or "Europe/Paris"),
                         duration_minutes=int(arguments.get("duration_minutes") or 30),
                     ),
-                    timeout=self.timeout_secs,
+                    timeout=timeout_secs,
                 )
             elif tool_name == "check_calendar_conflict":
                 result = await asyncio.wait_for(
@@ -208,7 +216,7 @@ class SchedulingToolRuntime:
                         end_iso=str(arguments.get("end_iso") or ""),
                         timezone=str(arguments.get("timezone") or "Europe/Paris"),
                     ),
-                    timeout=self.timeout_secs,
+                    timeout=timeout_secs,
                 )
             elif tool_name == "prepare_calendar_booking":
                 result = await asyncio.wait_for(
@@ -221,7 +229,7 @@ class SchedulingToolRuntime:
                         attendee_email=_optional_str(arguments.get("attendee_email")),
                         notes=_optional_str(arguments.get("notes")),
                     ),
-                    timeout=self.timeout_secs,
+                    timeout=timeout_secs,
                 )
             elif tool_name == "confirm_calendar_booking":
                 result = await asyncio.wait_for(
@@ -230,7 +238,7 @@ class SchedulingToolRuntime:
                         confirmation_text=_optional_str(arguments.get("confirmation_text")),
                         latest_user_text=getattr(self.recorder, "latest_user_text", None),
                     ),
-                    timeout=self.timeout_secs,
+                    timeout=timeout_secs,
                 )
             elif tool_name == "cancel_calendar_booking":
                 result = await asyncio.wait_for(
@@ -239,7 +247,7 @@ class SchedulingToolRuntime:
                         confirmation_text=_optional_str(arguments.get("confirmation_text")),
                         latest_user_text=getattr(self.recorder, "latest_user_text", None),
                     ),
-                    timeout=self.timeout_secs,
+                    timeout=timeout_secs,
                 )
             elif tool_name == "send_sms_followup":
                 result = await asyncio.wait_for(
@@ -248,7 +256,7 @@ class SchedulingToolRuntime:
                         body=str(arguments.get("body") or self.settings.integrations.followup_sms_default_body),
                         channel=str(arguments.get("channel") or "sms"),
                     ),
-                    timeout=self.timeout_secs,
+                    timeout=timeout_secs,
                 )
             elif tool_name == "send_email_followup":
                 result = await asyncio.wait_for(
@@ -257,7 +265,7 @@ class SchedulingToolRuntime:
                         subject=str(arguments.get("subject") or self.settings.integrations.followup_email_default_subject),
                         body=str(arguments.get("body") or self.settings.integrations.followup_email_default_body),
                     ),
-                    timeout=self.timeout_secs,
+                    timeout=timeout_secs,
                 )
             else:
                 result = {"ok": False, "outcome": "unknown_tool", "message": f"Unknown tool: {tool_name}"}
@@ -448,6 +456,16 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             recent_user_texts = getattr(recorder, "recent_user_texts", [])
             recent_text = " ".join(recent_user_texts[-8:])
             recent_tail = " ".join(recent_user_texts[-3:])
+            sms_result = await self._handle_sms_followup_turn(
+                latest_text=latest_text,
+                recent_tail=recent_tail,
+                direction=direction,
+            )
+            if sms_result:
+                if turn_id:
+                    handled_turns.add(turn_id)
+                return
+
             status_response = _booking_status_response(
                 latest_text,
                 last_booking_response=self.last_booking_response,
@@ -469,14 +487,8 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 await self._push_response(status_response, direction)
                 return
 
-            sms_result = await self._handle_sms_followup_turn(
-                latest_text=latest_text,
-                recent_tail=recent_tail,
-                direction=direction,
-            )
-            if sms_result:
-                if turn_id:
-                    handled_turns.add(turn_id)
+            if self.last_booking_response and not _has_post_booking_tool_intent(latest_text):
+                await self.push_frame(frame, direction)
                 return
 
             tool_latest_text = latest_text
@@ -517,6 +529,25 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                     once_per_turn=True,
                 )
                 await self._push_response("Your calendar is not connected yet.", direction)
+                return
+            if action.get("arguments", {}).get("missing_details"):
+                if turn_id:
+                    handled_turns.add(turn_id)
+                recorder.emit(
+                    "tool.direct.skipped",
+                    provider="tool",
+                    metadata={
+                        "client_id": client_id,
+                        **_tool_integration_metadata(settings, action["tool_name"]),
+                        "tool_name": action["tool_name"],
+                        "outcome": "missing_booking_details",
+                        "calendar_checked": False,
+                        "booking_booked": False,
+                        "text_preview": latest_text[:160],
+                    },
+                    once_per_turn=True,
+                )
+                await self._push_response(_calendar_response_text(action, {"ok": False, "outcome": "missing_booking_details"}), direction)
                 return
             if action["tool_name"] == "cancel_calendar_booking" and self.last_booking_id:
                 action["arguments"]["booking_id"] = self.last_booking_id
@@ -559,6 +590,8 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             suggested_action = _suggested_booking_action(result)
             if suggested_action:
                 self.last_suggested_action = suggested_action
+            elif action["tool_name"] == "prepare_and_confirm_calendar_booking" and result.get("outcome") == "confirmation_required":
+                self.last_suggested_action = _copy_calendar_action(action)
             if signature and result.get("ok") and result.get("outcome") == "booking_confirmed":
                 self.booked_signatures.add(signature)
                 booking_response = response_text
@@ -782,7 +815,14 @@ def _calendar_action_from_text(*, latest_text: str, recent_text: str) -> dict[st
                 "notes": "Booked by Verbatim voice agent after caller request.",
             },
         }
-    if _asks_for_calendar_conflict(latest) or _asks_for_calendar_conflict(lowered):
+    if _asks_for_calendar_conflict(latest) or (
+        latest_supplies_time
+        and _looks_like_slot_continuation(latest)
+        and _asks_for_calendar_conflict(lowered)
+    ) or (
+        _references_previous_calendar_slot(latest)
+        and _has_time(lowered)
+    ):
         date_time = _extract_calendar_datetime(combined)
         if date_time:
             return {
@@ -907,6 +947,8 @@ def _calendar_response_text(action: dict[str, Any], result: dict[str, Any]) -> s
         return "Just to confirm, should I remove it?"
     if outcome == "slot_conflict":
         return _busy_with_suggestion(result, prefix="That time is already booked, so I did not book it.")
+    if outcome == "timeout":
+        return "The calendar tool timed out, so I did not book it."
     if outcome == "missing_confirmed_booking":
         return "I do not have a confirmed booking here to remove."
     if outcome == "calendar_cancel_failed":
@@ -961,12 +1003,14 @@ def _is_calendar_action(action: dict[str, Any]) -> bool:
 
 
 def _suggested_booking_action(result: dict[str, Any]) -> dict[str, Any] | None:
-    slots = result.get("suggested_slots") or []
-    if not slots and result.get("outcome") == "available_slots":
-        slots = result.get("slots") or []
-    if not slots and result.get("outcome") == "calendar_conflict_checked" and not result.get("has_conflict"):
+    slots = []
+    if result.get("outcome") == "calendar_conflict_checked" and not result.get("has_conflict"):
         checked_slot = result.get("checked_slot")
         slots = [checked_slot] if checked_slot else []
+    if not slots:
+        slots = result.get("suggested_slots") or []
+    if not slots and result.get("outcome") == "available_slots":
+        slots = result.get("slots") or []
     if not slots:
         return None
     first = slots[0] or {}
@@ -1007,6 +1051,8 @@ def _booking_status_response(
     last_suggested_action: dict[str, Any] | None,
 ) -> str | None:
     lowered = text.lower()
+    if _has_unrelated_followup_question(lowered):
+        return None
     if _asks_to_create_booking(lowered):
         return None
     if not _is_booking_status_or_closing(lowered):
@@ -1023,6 +1069,23 @@ def _booking_status_response(
     if re.search(r"\b(already booked|you booked)\b", lowered):
         return "Yes, it is already booked."
     return "You are all set. Have a great day."
+
+
+def _has_post_booking_tool_intent(text: str) -> bool:
+    lowered = text.lower()
+    return bool(
+        _asks_booking_status(lowered)
+        or _asks_for_sms_followup(lowered)
+        or _asks_sms_status(lowered)
+        or _asks_to_cancel_calendar(lowered)
+        or _asks_to_create_booking(lowered)
+        or _asks_for_calendar_conflict(lowered)
+        or _asks_for_availability(lowered)
+    )
+
+
+def _has_unrelated_followup_question(text: str) -> bool:
+    return bool(re.search(r"\b(by the way|also|actually)\b.*\b(what|when|where|why|how|can|could|do|does|is|are)\b", text))
 
 
 def _is_booking_status_or_closing(text: str) -> bool:
@@ -1116,6 +1179,15 @@ def _asks_for_calendar_conflict(text: str) -> bool:
             r"can i (?:come by|visit|view|see)|could i (?:come by|visit|view|see)|"
             r"can we (?:come by|visit|view|see)|could we (?:come by|visit|view|see)|"
             r"come by|view it)\b",
+            text,
+        )
+    )
+
+
+def _references_previous_calendar_slot(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(that moment|that time|same time|another event|anything (?:in|on) my calendar|already have|conflict)\b",
             text,
         )
     )
@@ -1440,6 +1512,17 @@ def _extract_time(text: str) -> tuple[int, int] | None:
 
 def _has_time(text: str) -> bool:
     return _extract_time(text) is not None
+
+
+def _looks_like_slot_continuation(text: str) -> bool:
+    lowered = text.lower()
+    if len(lowered.split()) > 12:
+        return False
+    return bool(
+        _has_time(lowered)
+        or _extract_date(lowered, datetime.now(ZoneInfo("Europe/Paris"))) is not None
+        or re.search(r"\b(at|on|instead|that time|this time)\b", lowered)
+    )
 
 
 def _extract_email(text: str) -> str | None:

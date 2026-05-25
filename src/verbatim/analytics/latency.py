@@ -22,6 +22,12 @@ def summarize_call_events(events: Iterable[dict[str, Any]], *, call_id: str | No
         turn["turn_id"] = turn_id
         turn["timestamps"][name] = event.get("timestamp_monotonic_ms")
         metadata = event.get("metadata") or {}
+        if name.startswith("tool."):
+            turn["metadata"]["has_tool_turn"] = True
+            if name == "tool.call.failed":
+                turn["metadata"]["has_tool_failure"] = True
+            if metadata.get("duration_ms") is not None:
+                _set_metadata_latency(turn["latency"], "tool_duration_ms", metadata.get("duration_ms"))
         if name == "transcript.user":
             _set_metadata_timestamp(turn["timestamps"], "user.speech.started", metadata.get("user_speech_started_at_ms"))
             _set_metadata_timestamp(turn["timestamps"], "user.speech.stopped", metadata.get("user_speech_stopped_at_ms"))
@@ -52,7 +58,12 @@ def summarize_call_events(events: Iterable[dict[str, Any]], *, call_id: str | No
         "playback_delay_ms": _series(turn_list, "playback_delay_ms"),
         "transcript_to_llm_ms": _series(turn_list, "transcript_to_llm_ms"),
         "transcript_to_tts_audio_ms": _series(turn_list, "transcript_to_tts_audio_ms"),
+        "tool_duration_ms": _series(turn_list, "tool_duration_ms"),
     }
+    tool_turns = [turn for turn in turn_list if turn.get("metadata", {}).get("has_tool_turn")]
+    normal_turns = [turn for turn in turn_list if not turn.get("metadata", {}).get("has_tool_turn")]
+    tool_perceived = _series(tool_turns, "perceived_latency_ms")
+    normal_perceived = _series(normal_turns, "perceived_latency_ms")
     client_counts = Counter(
         _canonical_event_name(event.get("event_name"))
         for event in selected
@@ -76,6 +87,14 @@ def summarize_call_events(events: Iterable[dict[str, Any]], *, call_id: str | No
         "tool_event_counts": dict(tool_counts),
         "tool_call_count": tool_counts.get("tool.call.started", 0) + tool_counts.get("tool.direct.activated", 0),
         "tool_failed_count": tool_counts.get("tool.call.failed", 0),
+        "tool_turn_count": len(tool_turns),
+        "normal_turn_count": len(normal_turns),
+        "avg_tool_perceived_latency_ms": round(mean(tool_perceived), 1) if tool_perceived else None,
+        "p95_tool_perceived_latency_ms": percentile(tool_perceived, 95),
+        "max_tool_perceived_latency_ms": max(tool_perceived) if tool_perceived else None,
+        "avg_normal_perceived_latency_ms": round(mean(normal_perceived), 1) if normal_perceived else None,
+        "p95_normal_perceived_latency_ms": percentile(normal_perceived, 95),
+        "max_normal_perceived_latency_ms": max(normal_perceived) if normal_perceived else None,
         "livekit_client_stats": latest_stats,
         **config,
         **{f"avg_{name}": round(mean(values), 1) if values else None for name, values in metrics.items()},

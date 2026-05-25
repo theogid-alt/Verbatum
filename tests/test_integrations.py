@@ -665,6 +665,15 @@ def test_calendar_action_detects_exact_conflict_check():
     assert "T14:00:00" in action["arguments"]["start_iso"]
 
 
+def test_calendar_action_does_not_reactivate_stale_slot_on_closing_phrase():
+    action = _calendar_action_from_text(
+        latest_text="I'll see you then.",
+        recent_text="Can we do Wednesday at 10AM? Yes please. I'll see you then.",
+    )
+
+    assert action is None
+
+
 def test_calendar_action_treats_exact_availability_question_as_conflict_check():
     action = _calendar_action_from_text(
         latest_text="Friday at 2PM to visit one of your properties. Is that time available?",
@@ -688,6 +697,17 @@ def test_calendar_action_detects_business_busy_question():
 
 
 def test_calendar_action_checks_exact_viewing_request_before_llm():
+    action = _calendar_action_from_text(
+        latest_text="on Friday at 2PM?",
+        recent_text="Can I come by and view it on Friday at 2PM?",
+    )
+
+    assert action
+    assert action["tool_name"] == "check_calendar_conflict"
+    assert "T14:00:00" in action["arguments"]["start_iso"]
+
+
+def test_calendar_action_keeps_short_slot_continuations():
     action = _calendar_action_from_text(
         latest_text="on Friday at 2PM?",
         recent_text="Can I come by and view it on Friday at 2PM?",
@@ -812,6 +832,36 @@ def test_calendar_response_for_open_exact_slot_keeps_slot_actionable():
     assert "Friday May 29 at 2 PM is open" in response
     assert action
     assert action["arguments"]["start_iso"] == "2026-05-29T14:00:00+02:00"
+
+
+def test_open_slot_action_uses_checked_slot_not_later_suggestions():
+    result = {
+        "ok": True,
+        "outcome": "calendar_conflict_checked",
+        "has_conflict": False,
+        "checked_slot": {
+            "start_iso": "2026-05-27T10:00:00+02:00",
+            "end_iso": "2026-05-27T10:30:00+02:00",
+            "timezone": "Europe/Paris",
+        },
+        "suggested_slots": [
+            {"start_iso": "2026-05-27T10:30:00+02:00", "end_iso": "2026-05-27T11:00:00+02:00"}
+        ],
+    }
+
+    action = _suggested_booking_action(result)
+
+    assert action
+    assert action["arguments"]["start_iso"] == "2026-05-27T10:00:00+02:00"
+
+
+def test_calendar_timeout_response_is_truthful_about_no_booking():
+    response = _calendar_response_text(
+        {"tool_name": "prepare_and_confirm_calendar_booking", "arguments": {}},
+        {"ok": False, "outcome": "timeout"},
+    )
+
+    assert response == "The calendar tool timed out, so I did not book it."
 
 
 def test_calendar_suggestion_becomes_actionable_booking_option():

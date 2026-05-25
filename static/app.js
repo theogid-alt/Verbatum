@@ -1043,6 +1043,9 @@ async function refreshMetrics() {
     $("#configLine").textContent = `${summary.transport_provider || state.transport} · ${summary.stt_provider || state.sttProvider}/${summary.stt_model || state.sttModel} · ${summary.llm_provider || state.llmProvider}/${summary.llm_model || state.llmModel}`;
     if (summary.tool_call_count || summary.tools_enabled) {
       $("#configLine").textContent += ` · tools=${summary.tools_enabled ? "on" : "off"} calls=${summary.tool_call_count || 0}`;
+      if (summary.p95_normal_perceived_latency_ms || summary.p95_tool_perceived_latency_ms) {
+        $("#configLine").textContent += ` · normal p95=${ms(summary.p95_normal_perceived_latency_ms)} tool p95=${ms(summary.p95_tool_perceived_latency_ms)}`;
+      }
     }
     renderToolTerminalEvents(summary.latest_events || []);
     const stats = summary.livekit_client_stats || {};
@@ -1104,6 +1107,8 @@ function renderEvaluationAutoMetrics(metrics) {
   const cards = [
     ["Avg", ms(metrics.avg_perceived_latency_ms)],
     ["P95", ms(metrics.p95_perceived_latency_ms)],
+    ["Normal p95", ms(metrics.p95_normal_perceived_latency_ms)],
+    ["Tool p95", ms(metrics.p95_tool_perceived_latency_ms)],
     ["Max", ms(metrics.max_perceived_latency_ms)],
     ["STT avg", ms(metrics.avg_stt_processing_ms ?? metrics.avg_speech_to_transcript_ms)],
     ["STT p95", ms(metrics.p95_stt_processing_ms ?? metrics.p95_speech_to_transcript_ms)],
@@ -1113,7 +1118,8 @@ function renderEvaluationAutoMetrics(metrics) {
     ["TTS p95", ms(metrics.p95_tts_first_audio_ms)],
     ["Playback", ms(metrics.avg_playback_delay_ms)],
     ["Transcript→LLM", ms(metrics.avg_transcript_to_llm_ms)],
-    ["Tools", `${metrics.tool_call_count || 0} calls · ${metrics.tool_failed_count || 0} failed`],
+    ["Tools", `${metrics.tool_call_count || 0} calls · ${metrics.tool_failed_count || 0} failed · ${metrics.tool_turn_count || 0} turns`],
+    ["Tool duration", ms(metrics.avg_tool_duration_ms)],
     ["Network", stats.connection_state ? `${stats.inbound_packet_loss_pct ?? "n/a"}% loss · ${stats.jitter_ms ?? "n/a"}ms jitter` : "n/a"],
   ];
   evaluationAutoMetrics.innerHTML = cards.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");

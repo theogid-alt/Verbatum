@@ -103,6 +103,26 @@ def test_latency_summary_counts_direct_tool_actions_as_tool_calls():
     assert summary["tool_event_counts"]["tool.direct.activated"] == 1
 
 
+def test_latency_summary_splits_normal_and_tool_turn_p95():
+    events = [
+        event("call_a", "turn_0001", "transcript.user", 1000),
+        event("call_a", "turn_0001", "assistant.playback_started", 1300),
+        event("call_a", "turn_0002", "transcript.user", 2000),
+        event("call_a", "turn_0002", "tool.direct.activated", 2050),
+        event("call_a", "turn_0002", "tool.call.completed", 2500),
+        event("call_a", "turn_0002", "assistant.playback_started", 5000),
+    ]
+    events[4]["metadata"] = {"tool_name": "confirm_calendar_booking", "duration_ms": 450}
+
+    summary = summarize_call_events(events, call_id="call_a")
+
+    assert summary["normal_turn_count"] == 1
+    assert summary["tool_turn_count"] == 1
+    assert summary["avg_normal_perceived_latency_ms"] == 300
+    assert summary["avg_tool_perceived_latency_ms"] == 3000
+    assert summary["avg_tool_duration_ms"] == 450
+
+
 def test_call_notes_are_generated_from_transcript_and_tool_events():
     user = event("call_a", "turn_0001", "transcript.user", 1000)
     user["metadata"] = {"text": "Can you book Friday at 2?"}
