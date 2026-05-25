@@ -792,11 +792,31 @@ def test_llm_tool_truth_guard_blocks_fake_booking_and_sms_claims():
 
     assert _unverified_tool_claim_replacement("Done, I booked the viewing.", recorder)
     assert _unverified_tool_claim_replacement("I sent the SMS confirmation.", recorder)
+    assert _unverified_tool_claim_replacement("You can hang up and I will book the viewing after the call.", recorder) == (
+        "I can only book it here once I have the exact day and time."
+    )
+    assert _unverified_tool_claim_replacement("I'll send the confirmation email later.", recorder) == (
+        "I can only send an SMS confirmation after the viewing is booked."
+    )
 
     recorder.calendar_booking_confirmed = True
+    assert _unverified_tool_claim_replacement("I'll send the confirmation message now.", recorder) == (
+        "Want me to text you the viewing confirmation?"
+    )
     recorder.sms_followup_sent = True
     assert _unverified_tool_claim_replacement("Done, I booked the viewing.", recorder) is None
     assert _unverified_tool_claim_replacement("I sent the SMS confirmation.", recorder) is None
+
+
+def test_calendar_action_recovers_split_booking_date_and_time():
+    action = _calendar_action_from_text(
+        latest_text="6:30 AM.",
+        recent_text="I want to book a viewing. Monday works. Morning maybe 6:30 AM.",
+    )
+
+    assert action
+    assert action["tool_name"] == "prepare_and_confirm_calendar_booking"
+    assert "T06:30:00" in action["arguments"]["start_iso"]
 
 
 def test_calendar_response_suggests_next_slot_on_conflict():

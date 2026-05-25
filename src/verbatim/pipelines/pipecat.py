@@ -443,7 +443,7 @@ def _llm_output_guard(recorder: PipelineRecorder, session: AgentSession):
     allowed_identity_text = f"{session.system_prompt or ''}\n{session.knowledge_base or ''}".lower()
     stale_identity_terms = ["du" + "bai", "cr" + "tg", "ali" + "cia"]
     blocked_terms = [term for term in stale_identity_terms if term not in allowed_identity_text]
-    identity_fallback = "I help with real estate questions. What would you like to know?"
+    identity_fallback = "I can help with that."
 
     class LLMOutputGuard(FrameProcessor):
         def __init__(self) -> None:
@@ -481,6 +481,24 @@ def _llm_output_guard(recorder: PipelineRecorder, session: AgentSession):
 
 def _unverified_tool_claim_replacement(text: str, recorder: PipelineRecorder) -> str | None:
     lowered = text.lower()
+    if not recorder.calendar_booking_confirmed and re.search(
+        r"\b(hang up|end (?:the )?call|after (?:the )?call|once (?:we|you) (?:hang up|end)|later)\b.*"
+        r"\b(book|schedule|arrange|set up|add).*\b(viewing|appointment|booking|calendar)\b|"
+        r"\b(i'?ll|i will|we'?ll|we will|going to|gonna)\b.*"
+        r"\b(book|schedule|arrange|set up|add).*\b(viewing|appointment|booking|calendar)\b",
+        lowered,
+    ):
+        return "I can only book it here once I have the exact day and time."
+    if not recorder.sms_followup_sent and re.search(
+        r"\b(hang up|end (?:the )?call|after (?:the )?call|once (?:we|you) (?:hang up|end)|later)\b.*"
+        r"\b(send|text|message|email).*\b(confirmation|sms|text|message|email)\b|"
+        r"\b(i'?ll|i will|we'?ll|we will|going to|gonna)\b.*"
+        r"\b(send|text|message|email).*\b(confirmation|sms|text|message|email)\b",
+        lowered,
+    ):
+        if recorder.calendar_booking_confirmed:
+            return "Want me to text you the viewing confirmation?"
+        return "I can only send an SMS confirmation after the viewing is booked."
     if not recorder.calendar_booking_confirmed and re.search(
         r"\b(done|confirmed|scheduled|booked|added)\b.*\b(viewing|appointment|calendar|booking)\b|"
         r"\b(viewing|appointment|booking)\b.*\b(done|confirmed|scheduled|booked|added)\b",

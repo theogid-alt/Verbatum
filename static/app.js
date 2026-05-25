@@ -76,6 +76,7 @@ const evaluationVersionSummary = $("#evaluationVersionSummary");
 const evaluationAutoMetrics = $("#evaluationAutoMetrics");
 const evaluationFields = $("#evaluationFields");
 const evaluationNotesInput = $("#evaluationNotesInput");
+const DEFAULT_EVALUATION_VERSION = "v02.3";
 const toolsEnabledInput = $("#toolsEnabledInput");
 const integrationStatusButton = $("#integrationStatusButton");
 const integrationStatusLine = $("#integrationStatusLine");
@@ -1074,7 +1075,7 @@ async function evaluateCurrentCall() {
     evaluationStatusLine.textContent = "Create or select a call before evaluating.";
     return;
   }
-  const botVersion = sanitizeBotVersion(evaluationVersionInput?.value || "v02");
+  const botVersion = sanitizeBotVersion(evaluationVersionInput?.value || DEFAULT_EVALUATION_VERSION);
   const context = await fetch(`/api/evaluations/call?call_id=${encodeURIComponent(callId)}&bot_version=${encodeURIComponent(botVersion)}`).then((response) => response.json());
   state.evaluationContext = context;
   renderEvaluationContext(context);
@@ -1089,7 +1090,7 @@ async function evaluateCurrentCall() {
 function renderEvaluationContext(context) {
   const saved = context.saved_evaluation || null;
   const summary = saved?.score_summary || {};
-  const botVersion = saved?.bot_version || context.bot_version || sanitizeBotVersion(evaluationVersionInput?.value || "v02");
+  const botVersion = saved?.bot_version || context.bot_version || sanitizeBotVersion(evaluationVersionInput?.value || DEFAULT_EVALUATION_VERSION);
   if (evaluationVersionInput) evaluationVersionInput.value = botVersion;
   evaluationStatusLine.textContent = `Call ${context.call_id || "n/a"} · ${botVersion} · ${context.transcript?.length || 0} transcript items · ${context.call_notes?.status || "waiting"}`;
   evaluationSavedState.textContent = saved ? "Yes" : "No";
@@ -1165,7 +1166,7 @@ function evaluationPayloadFromForm() {
     scores[fieldId] = { score, notes };
   });
   return {
-    bot_version: sanitizeBotVersion(evaluationVersionInput?.value || "v02"),
+    bot_version: sanitizeBotVersion(evaluationVersionInput?.value || DEFAULT_EVALUATION_VERSION),
     scores,
     reviewer_notes: evaluationNotesInput.value || "",
   };
@@ -1193,7 +1194,7 @@ async function saveEvaluation() {
     saved_evaluation: report,
   };
   evaluationSavedState.textContent = "Yes";
-  evaluationStatusLine.textContent = `Saved evaluation for ${callId} · ${report.bot_version || "v02"}`;
+  evaluationStatusLine.textContent = `Saved evaluation for ${callId} · ${report.bot_version || DEFAULT_EVALUATION_VERSION}`;
   await refreshEvaluationVersionSummary();
   log("Evaluation saved", {
     call_id: callId,
@@ -1207,7 +1208,7 @@ async function refreshEvaluationVersionSummary() {
   if (!evaluationVersionSummary) return;
   try {
     const summary = await fetch("/api/evaluations/summary").then((response) => response.json());
-    const version = sanitizeBotVersion(evaluationVersionInput?.value || "v02");
+    const version = sanitizeBotVersion(evaluationVersionInput?.value || DEFAULT_EVALUATION_VERSION);
     const selected = (summary.versions || []).find((item) => item.bot_version === version);
     if (!selected) {
       evaluationVersionSummary.textContent = `${version}: no saved evaluations yet`;
@@ -1224,8 +1225,8 @@ async function refreshEvaluationVersionSummary() {
 }
 
 function sanitizeBotVersion(value) {
-  const cleaned = String(value || "v02").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[-._]+|[-._]+$/g, "");
-  return cleaned || "v02";
+  const cleaned = String(value || DEFAULT_EVALUATION_VERSION).trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[-._]+|[-._]+$/g, "");
+  return cleaned || DEFAULT_EVALUATION_VERSION;
 }
 
 function renderToolTerminalEvents(events) {
@@ -1394,7 +1395,7 @@ saveEvaluationButton.addEventListener("click", () => saveEvaluation().catch((err
 
 evaluationNotesInput.addEventListener("input", updateEvaluationPreview);
 evaluationVersionInput.addEventListener("change", () => {
-  evaluationVersionInput.value = sanitizeBotVersion(evaluationVersionInput.value || "v02");
+  evaluationVersionInput.value = sanitizeBotVersion(evaluationVersionInput.value || DEFAULT_EVALUATION_VERSION);
   refreshEvaluationVersionSummary();
 });
 

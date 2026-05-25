@@ -440,6 +440,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             self.pending_sms_body: str | None = None
             self.last_sms_response: str | None = None
             self.awaiting_sms_offer_response = False
+            self.pending_booking_fragments: list[str] = []
 
         async def process_frame(self, frame, direction: FrameDirection):
             await super().process_frame(frame, direction)
@@ -454,7 +455,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
 
             latest_text = recorder.latest_user_text or ""
             recent_user_texts = getattr(recorder, "recent_user_texts", [])
-            recent_text = " ".join(recent_user_texts[-8:])
+            recent_text = " ".join((self.pending_booking_fragments + recent_user_texts)[-10:])
             recent_tail = " ".join(recent_user_texts[-3:])
             sms_result = await self._handle_sms_followup_turn(
                 latest_text=latest_text,
@@ -531,6 +532,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 await self._push_response("Your calendar is not connected yet.", direction)
                 return
             if action.get("arguments", {}).get("missing_details"):
+                self._remember_booking_fragment(latest_text)
                 if turn_id:
                     handled_turns.add(turn_id)
                 recorder.emit(
@@ -593,6 +595,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             elif action["tool_name"] == "prepare_and_confirm_calendar_booking" and result.get("outcome") == "confirmation_required":
                 self.last_suggested_action = _copy_calendar_action(action)
             if signature and result.get("ok") and result.get("outcome") == "booking_confirmed":
+                self.pending_booking_fragments = []
                 self.booked_signatures.add(signature)
                 booking_response = response_text
                 self.last_booking_response = booking_response
@@ -606,6 +609,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 else:
                     self.pending_sms_body = None
             if result.get("ok") and result.get("outcome") == "booking_cancelled":
+                self.pending_booking_fragments = []
                 self.last_booking_response = None
                 self.last_booking_id = None
                 self.last_suggested_action = None
@@ -623,6 +627,14 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             await self.push_frame(LLMFullResponseStartFrame(), direction)
             await self.push_frame(LLMTextFrame(response_text), direction)
             await self.push_frame(LLMFullResponseEndFrame(), direction)
+
+        def _remember_booking_fragment(self, text: str) -> None:
+            cleaned = text.strip()
+            if not cleaned:
+                return
+            if cleaned not in self.pending_booking_fragments:
+                self.pending_booking_fragments.append(cleaned)
+            self.pending_booking_fragments = self.pending_booking_fragments[-6:]
 
         async def _handle_sms_followup_turn(self, *, latest_text: str, recent_tail: str, direction: FrameDirection) -> bool:
             wants_sms = _asks_for_sms_followup(latest_text)

@@ -19,7 +19,7 @@ EVALUATION_SCHEMA = "verbatim.v2.evaluation"
 CONTEXT_SCHEMA = "verbatim.v2.evaluation_context"
 SUMMARY_SCHEMA = "verbatim.v2.evaluation_summary"
 RUBRIC_VERSION = 2
-DEFAULT_BOT_VERSION = "v02"
+DEFAULT_BOT_VERSION = "v02.3"
 
 
 DEFAULT_RUBRIC_FIELDS: tuple[dict[str, Any], ...] = (
