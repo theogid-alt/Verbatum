@@ -123,6 +123,26 @@ def test_latency_summary_splits_normal_and_tool_turn_p95():
     assert summary["avg_tool_duration_ms"] == 450
 
 
+def test_latency_summary_reports_clean_average_without_over_2000_ms_peaks():
+    events = [
+        event("call_a", "turn_0001", "transcript.user", 1000),
+        event("call_a", "turn_0001", "assistant.playback_started", 1600),
+        event("call_a", "turn_0002", "transcript.user", 2000),
+        event("call_a", "turn_0002", "assistant.playback_started", 2800),
+        event("call_a", "turn_0003", "transcript.user", 3000),
+        event("call_a", "turn_0003", "assistant.playback_started", 6500),
+    ]
+
+    summary = summarize_call_events(events, call_id="call_a")
+
+    assert summary["avg_perceived_latency_ms"] == 1633.3
+    assert summary["avg_clean_perceived_latency_ms"] == 700
+    assert summary["latency_peak_threshold_ms"] == 2000
+    assert summary["clean_turn_count"] == 2
+    assert summary["peak_turn_count"] == 1
+    assert summary["p95_perceived_latency_ms"] == 3500
+
+
 def test_call_notes_are_generated_from_transcript_and_tool_events():
     user = event("call_a", "turn_0001", "transcript.user", 1000)
     user["metadata"] = {"text": "Can you book Friday at 2?"}

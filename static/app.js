@@ -1031,7 +1031,7 @@ async function refreshMetrics() {
     const callNotes = metricsCallId
       ? await fetch(`/api/analytics/call-notes?call_id=${encodeURIComponent(metricsCallId)}`).then((response) => response.json())
       : null;
-    $("#metricAvg").textContent = ms(summary.avg_perceived_latency_ms);
+    $("#metricAvg").textContent = ms(summary.avg_clean_perceived_latency_ms ?? summary.avg_perceived_latency_ms);
     $("#metricP95").textContent = ms(summary.p95_perceived_latency_ms);
     $("#metricStt").textContent = ms(summary.avg_stt_processing_ms ?? summary.avg_speech_to_transcript_ms);
     $("#metricTtft").textContent = ms(summary.avg_provider_ttft_ms);
@@ -1106,8 +1106,10 @@ function renderEvaluationContext(context) {
 function renderEvaluationAutoMetrics(metrics) {
   const stats = metrics.livekit_client_stats || {};
   const cards = [
-    ["Avg", ms(metrics.avg_perceived_latency_ms)],
+    ["Avg", ms(metrics.avg_clean_perceived_latency_ms ?? metrics.avg_perceived_latency_ms)],
     ["P95", ms(metrics.p95_perceived_latency_ms)],
+    ["Raw avg", ms(metrics.avg_perceived_latency_ms)],
+    ["Peaks", `${metrics.peak_turn_count || 0} > ${ms(metrics.latency_peak_threshold_ms || 2000)}`],
     ["Normal p95", ms(metrics.p95_normal_perceived_latency_ms)],
     ["Tool p95", ms(metrics.p95_tool_perceived_latency_ms)],
     ["Max", ms(metrics.max_perceived_latency_ms)],

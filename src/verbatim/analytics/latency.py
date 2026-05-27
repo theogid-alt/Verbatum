@@ -64,6 +64,9 @@ def summarize_call_events(events: Iterable[dict[str, Any]], *, call_id: str | No
     normal_turns = [turn for turn in turn_list if not turn.get("metadata", {}).get("has_tool_turn")]
     tool_perceived = _series(tool_turns, "perceived_latency_ms")
     normal_perceived = _series(normal_turns, "perceived_latency_ms")
+    clean_perceived = _without_peaks(metrics["perceived_latency_ms"])
+    clean_normal_perceived = _without_peaks(normal_perceived)
+    clean_tool_perceived = _without_peaks(tool_perceived)
     client_counts = Counter(
         _canonical_event_name(event.get("event_name"))
         for event in selected
@@ -89,10 +92,16 @@ def summarize_call_events(events: Iterable[dict[str, Any]], *, call_id: str | No
         "tool_failed_count": tool_counts.get("tool.call.failed", 0),
         "tool_turn_count": len(tool_turns),
         "normal_turn_count": len(normal_turns),
+        "latency_peak_threshold_ms": 2000,
+        "clean_turn_count": len(clean_perceived),
+        "peak_turn_count": len(metrics["perceived_latency_ms"]) - len(clean_perceived),
+        "avg_clean_perceived_latency_ms": round(mean(clean_perceived), 1) if clean_perceived else None,
         "avg_tool_perceived_latency_ms": round(mean(tool_perceived), 1) if tool_perceived else None,
+        "avg_clean_tool_perceived_latency_ms": round(mean(clean_tool_perceived), 1) if clean_tool_perceived else None,
         "p95_tool_perceived_latency_ms": percentile(tool_perceived, 95),
         "max_tool_perceived_latency_ms": max(tool_perceived) if tool_perceived else None,
         "avg_normal_perceived_latency_ms": round(mean(normal_perceived), 1) if normal_perceived else None,
+        "avg_clean_normal_perceived_latency_ms": round(mean(clean_normal_perceived), 1) if clean_normal_perceived else None,
         "p95_normal_perceived_latency_ms": percentile(normal_perceived, 95),
         "max_normal_perceived_latency_ms": max(normal_perceived) if normal_perceived else None,
         "livekit_client_stats": latest_stats,
@@ -117,6 +126,10 @@ def _canonical_event_name(value: Any) -> str:
 
 def _series(turns: list[dict[str, Any]], key: str) -> list[float]:
     return [turn["latency"][key] for turn in turns if key in turn.get("latency", {})]
+
+
+def _without_peaks(values: list[float], *, threshold_ms: float = 2000) -> list[float]:
+    return [value for value in values if value <= threshold_ms]
 
 
 def _set_delta(
