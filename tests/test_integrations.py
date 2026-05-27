@@ -1,4 +1,6 @@
 import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 import respx
@@ -10,9 +12,12 @@ from verbatim.integrations.store import CALENDAR_TOOL_NAMES, IntegrationStore
 from verbatim.integrations.tools import (
     _accepts_suggested_slot,
     _booking_status_response,
+    _booking_sms_body,
     _calendar_action_from_text,
     _asks_sms_status,
     _calendar_response_text,
+    _extract_calendar_datetime,
+    _extract_date,
     _extract_phone,
     _extract_phone_fragment,
     _extract_phone_fragment_parts,
@@ -20,6 +25,7 @@ from verbatim.integrations.tools import (
     _followup_action_from_text,
     _followup_response_text,
     _merge_phone_fragments,
+    _property_details_sms_body,
     _suggested_booking_action,
     _validate_phone,
     SchedulingToolRuntime,
@@ -502,6 +508,36 @@ def test_sms_followup_response_is_viewing_confirmation():
     assert response == "Done, I sent the viewing confirmation."
 
 
+def test_sms_followup_response_can_be_property_details():
+    response = _followup_response_text(
+        {"tool_name": "send_sms_followup", "arguments": {"message_kind": "property_details"}},
+        {"ok": True, "outcome": "sms_sent"},
+    )
+
+    assert response == "Done, I sent the property details."
+
+
+def test_property_details_sms_body_uses_kb_when_available():
+    body = _property_details_sms_body(
+        "Property 506\nPrice: 250000 EUR\nAddress: 12 Palm Road",
+        fallback="An agent will follow up.",
+    )
+
+    assert "Property 506" in body
+    assert "250000 EUR" in body
+    assert "12 Palm Road" in body
+
+
+def test_booking_sms_body_includes_address_or_safe_address_followup():
+    result = {"booking": {"start_iso": "2026-06-26T19:00:00+02:00"}}
+
+    with_address = _booking_sms_body(result, fallback="Booked.", knowledge_base="Address: 12 Palm Road")
+    without_address = _booking_sms_body(result, fallback="Booked.", knowledge_base="")
+
+    assert "Address: 12 Palm Road." in with_address
+    assert "agent will send the address an hour before" in without_address
+
+
 def test_followup_action_ignores_email_for_now():
     action = _followup_action_from_text(
         latest_text="Send me an email at caller@example.com.",
@@ -553,6 +589,16 @@ def test_calendar_action_parses_flux_spoken_may_date_and_word_time():
     assert "2026-06-26T19:00:00" in action["arguments"]["start_iso"]
 
 
+def test_calendar_datetime_parses_month_day_before_weekday_fallback():
+    parsed_date = _extract_date("No, Wednesday May 27 at 1PM.", datetime(2026, 5, 27, 9, tzinfo=ZoneInfo("Europe/Paris")))
+    parsed = _extract_calendar_datetime("No, Wednesday May 27 2026 at 1PM.")
+
+    assert parsed_date
+    assert parsed_date.date().isoformat() == "2026-05-27"
+    assert parsed
+    assert "2026-05-27T13:00:00" in parsed["start_iso"]
+
+
 def test_calendar_action_uses_prior_spoken_date_when_latest_supplies_word_time():
     action = _calendar_action_from_text(
         latest_text="Friday, seven PM.",
@@ -579,6 +625,16 @@ def test_calendar_action_asks_for_missing_booking_details():
     assert action
     assert action["tool_name"] == "prepare_and_confirm_calendar_booking"
     assert action["arguments"]["missing_details"] is True
+
+
+def test_calendar_action_suggests_slots_when_user_wants_to_visit_without_time():
+    action = _calendar_action_from_text(
+        latest_text="Can I visit the one we just talked about?",
+        recent_text="Can I visit the one we just talked about?",
+    )
+
+    assert action
+    assert action["tool_name"] == "check_calendar_availability"
 
 
 def test_calendar_responses_frame_bookings_as_property_viewings():

@@ -443,7 +443,6 @@ def _llm_output_guard(recorder: PipelineRecorder, session: AgentSession):
     allowed_identity_text = f"{session.system_prompt or ''}\n{session.knowledge_base or ''}".lower()
     stale_identity_terms = ["du" + "bai", "cr" + "tg", "ali" + "cia"]
     blocked_terms = [term for term in stale_identity_terms if term not in allowed_identity_text]
-    identity_fallback = "I can help with that."
 
     class LLMOutputGuard(FrameProcessor):
         def __init__(self) -> None:
@@ -460,7 +459,7 @@ def _llm_output_guard(recorder: PipelineRecorder, session: AgentSession):
                         provider=recorder.llm_provider,
                         metadata={"llm_provider": recorder.llm_provider, "llm_model": recorder.llm_model},
                     )
-                    frame.text = identity_fallback
+                    frame.text = ""
                 else:
                     tool_truth_fallback = _unverified_tool_claim_replacement(text, recorder)
                     if tool_truth_fallback:

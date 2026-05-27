@@ -119,6 +119,7 @@ def test_default_prompts_guide_viewing_and_sms_confirmation():
 
     assert "property viewing" in active_prompt_text
     assert "sms confirmation" in active_prompt_text
+    assert "listing reference" in active_prompt_text
 
 
 def test_hume_config_is_opt_in_to_avoid_stale_remote_prompts():

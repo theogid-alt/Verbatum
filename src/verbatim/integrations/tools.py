@@ -110,7 +110,7 @@ def build_scheduling_tools_schema(enabled_tool_names: set[str] | None = None):
             FunctionSchema(
                 name="send_sms_followup",
                 description=(
-                    "Send a short SMS follow-up to the caller phone number attached to this call. "
+                    "Send a short SMS follow-up or property-detail message to the caller phone number attached to this call. "
                     "Never ask the caller to dictate a phone number."
                 ),
                 properties={
@@ -533,6 +533,36 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 return
             if action.get("arguments", {}).get("missing_details"):
                 self._remember_booking_fragment(latest_text)
+                if "check_calendar_availability" in enabled_tools and _should_suggest_slots_for_missing_details(action):
+                    if turn_id:
+                        handled_turns.add(turn_id)
+                    availability_action = {
+                        "tool_name": "check_calendar_availability",
+                        "arguments": {
+                            "date_iso": action.get("arguments", {}).get("date_iso"),
+                            "timezone": action.get("arguments", {}).get("timezone") or "Europe/Paris",
+                            "duration_minutes": 30,
+                        },
+                    }
+                    recorder.emit(
+                        "tool.direct.activated",
+                        provider="tool",
+                        metadata={
+                            "client_id": client_id,
+                            **_tool_integration_metadata(settings, "check_calendar_availability"),
+                            "tool_name": "check_calendar_availability",
+                            "text_preview": latest_text[:160],
+                            "direct_tool": True,
+                            "reason": "suggest_slots_for_missing_booking_details",
+                        },
+                        once_per_turn=True,
+                    )
+                    result = await _run_calendar_action(runtime, availability_action, latest_text=latest_text)
+                    suggested_action = _suggested_booking_action(result)
+                    if suggested_action:
+                        self.last_suggested_action = suggested_action
+                    await self._push_response(_calendar_response_text(availability_action, result), direction)
+                    return
                 if turn_id:
                     handled_turns.add(turn_id)
                 recorder.emit(
@@ -602,7 +632,11 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 booking = result.get("booking") or {}
                 self.last_booking_id = str(booking.get("id") or "") or self.last_booking_id
                 self.last_suggested_action = None
-                self.pending_sms_body = _booking_sms_body(result, fallback=booking_response)
+                self.pending_sms_body = _booking_sms_body(
+                    result,
+                    fallback=booking_response,
+                    knowledge_base=getattr(session, "knowledge_base", None),
+                )
                 if runtime.caller_phone:
                     self.awaiting_sms_offer_response = True
                     response_text = f"{booking_response} Want me to text you the viewing confirmation?"
@@ -673,6 +707,13 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 return False
             if wants_sms or asks_sms_status:
                 if not self.pending_sms_body and not self.last_booking_response:
+                    if wants_sms:
+                        await self._send_property_details_sms(
+                            latest_text=latest_text,
+                            recent_tail=recent_tail,
+                            direction=direction,
+                        )
+                        return True
                     recorder.emit(
                         "tool.direct.skipped",
                         provider="tool",
@@ -692,6 +733,38 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 await self._send_sms_confirmation(sms_body=sms_body, latest_text=latest_text, direction=direction)
                 return True
             return False
+
+        async def _send_property_details_sms(self, *, latest_text: str, recent_tail: str, direction: FrameDirection) -> None:
+            action = {
+                "tool_name": "send_sms_followup",
+                "arguments": {
+                    "body": _property_details_sms_body(
+                        getattr(session, "knowledge_base", None),
+                        fallback=settings.integrations.followup_sms_default_body,
+                    ),
+                    "channel": "sms",
+                    "message_kind": "property_details",
+                },
+            }
+            recorder.emit(
+                "tool.direct.activated",
+                provider="tool",
+                metadata={
+                    "client_id": client_id,
+                    **_tool_integration_metadata(settings, "send_sms_followup"),
+                    "tool_name": "send_sms_followup",
+                    "caller_phone_configured": bool(runtime.caller_phone),
+                    "direct_tool": True,
+                    "message_kind": "property_details",
+                    "text_preview": f"{recent_tail} {latest_text}".strip()[:160],
+                },
+                once_per_turn=True,
+            )
+            result = await _run_followup_action(runtime, action)
+            response_text = _followup_response_text(action, result)
+            if result.get("ok"):
+                self.last_sms_response = "Yes, I sent the property details."
+            await self._push_response(response_text, direction)
 
         async def _push_unavailable_calendar_response(self, *, action: dict[str, Any], latest_text: str, direction: FrameDirection) -> None:
             metadata = {
@@ -715,6 +788,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 "arguments": {
                     "body": sms_body,
                     "channel": "sms",
+                    "message_kind": "viewing_confirmation",
                 },
             }
             recorder.emit(
@@ -802,6 +876,17 @@ def _calendar_action_from_text(*, latest_text: str, recent_text: str) -> dict[st
         }
     if _asks_booking_status(latest) and not _asks_to_create_booking(latest):
         return None
+    if _asks_for_viewing_without_slot(latest):
+        date_time = _extract_calendar_datetime(combined)
+        date_value = _extract_date(combined, datetime.now(ZoneInfo("Europe/Paris")))
+        return {
+            "tool_name": "check_calendar_availability",
+            "arguments": {
+                "date_iso": date_time["date_iso"] if date_time else (date_value.date().isoformat() if date_value else None),
+                "timezone": "Europe/Paris",
+                "duration_minutes": 30,
+            },
+        }
     recent_has_booking_context = _asks_to_create_booking(lowered) or bool(re.search(r"\b(viewing|appointment|property tour)\b", lowered))
     latest_supplies_time = _has_time(latest) or _extract_date(latest, datetime.now(ZoneInfo("Europe/Paris"))) is not None
     should_book = (
@@ -970,9 +1055,12 @@ def _calendar_response_text(action: dict[str, Any], result: dict[str, Any]) -> s
 
 def _followup_response_text(action: dict[str, Any], result: dict[str, Any]) -> str:
     outcome = str(result.get("outcome") or "")
+    message_kind = str((action.get("arguments") or {}).get("message_kind") or "")
     if result.get("ok"):
         if outcome == "email_sent":
             return "Done, I sent the email."
+        if message_kind == "property_details":
+            return "Done, I sent the property details."
         return "Done, I sent the viewing confirmation."
     if outcome in {"missing_phone_destination", "missing_email_destination"}:
         return str(result.get("message") or "Where should I send it?")
@@ -1012,6 +1100,15 @@ def _is_calendar_action(action: dict[str, Any]) -> bool:
         "prepare_and_confirm_calendar_booking",
         "unsupported_calendar_read",
     }
+
+
+def _should_suggest_slots_for_missing_details(action: dict[str, Any]) -> bool:
+    arguments = action.get("arguments") or {}
+    if action.get("tool_name") != "prepare_and_confirm_calendar_booking" or not arguments.get("missing_details"):
+        return False
+    if arguments.get("missing_day") and not arguments.get("date_iso"):
+        return False
+    return True
 
 
 def _suggested_booking_action(result: dict[str, Any]) -> dict[str, Any] | None:
@@ -1105,7 +1202,7 @@ def _is_booking_status_or_closing(text: str) -> bool:
         re.search(
             r"\b(already booked|you booked|did you book|is it booked|what about (?:the )?booking|"
             r"booking (?:doesn'?t|does not|didn'?t|did not) seem|is it on (?:the )?(?:google )?calendar|"
-            r"on (?:the )?(?:google )?calendar|thank you|thanks|have a great day|bye|goodbye|that'?s all)\b",
+            r"on (?:the )?(?:google )?calendar|thank you|thanks|never mind|nevermind|have a great day|bye|goodbye|that'?s all)\b",
             text,
         )
     )
@@ -1127,7 +1224,8 @@ def _asks_for_sms_followup(text: str) -> bool:
     return bool(
         re.search(
             r"\b(text me|send (?:me )?(?:a )?(?:text|sms|message)|send it by text|message me|"
-            r"send (?:me )?(?:the )?(?:confirmation|details|options)|confirmation text)\b",
+            r"send (?:me )?(?:the )?(?:confirmation|details|options|info|information|link|property details|property link)|"
+            r"confirmation text)\b",
             lowered,
         )
     )
@@ -1145,12 +1243,12 @@ def _asks_sms_status(text: str) -> bool:
 
 
 def _rejects_confirmation(text: str) -> bool:
-    return bool(re.search(r"\b(no|nope|not that|wrong|incorrect|hold on|wait|don'?t|do not|cancel)\b", text.lower()))
+    return bool(re.search(r"\b(no|nope|not that|wrong|incorrect|hold on|wait|don'?t|do not|cancel|never mind|nevermind)\b", text.lower()))
 
 
 def _accepts_suggested_slot(text: str, *, recent_tail: str = "") -> bool:
     combined = f"{recent_tail} {text}".lower()
-    if re.search(r"\b(no|nope|not yet|wait|hold on|don'?t|do not|wrong|cancel)\b", combined):
+    if re.search(r"\b(no|nope|not yet|wait|hold on|don'?t|do not|wrong|cancel|never mind|nevermind)\b", combined):
         return False
     return bool(
         re.search(
@@ -1205,6 +1303,16 @@ def _references_previous_calendar_slot(text: str) -> bool:
     )
 
 
+def _asks_for_viewing_without_slot(text: str) -> bool:
+    lowered = text.lower()
+    if _has_time(lowered):
+        return False
+    return bool(
+        re.search(r"\b(visit|view|see|come by|tour)\b", lowered)
+        and re.search(r"\b(property|home|house|villa|apartment|flat|listing|one|it)\b", lowered)
+    )
+
+
 def _asks_to_book(text: str) -> bool:
     return bool(re.search(r"\b(book|schedule|set up|put|add|create)\b", text)) and bool(
         re.search(r"\b(calendar|appointment|meeting|viewing|slot|it|that)\b", text)
@@ -1251,11 +1359,15 @@ def _extract_calendar_datetime(text: str) -> dict[str, str] | None:
     }
 
 
-def _missing_calendar_details(text: str) -> dict[str, bool]:
+def _missing_calendar_details(text: str) -> dict[str, Any]:
     now = datetime.now(ZoneInfo("Europe/Paris"))
-    has_date = _extract_date(text, now) is not None
+    date_value = _extract_date(text, now)
+    has_date = date_value is not None
     has_time = _extract_time(text) is not None
-    details: dict[str, bool] = {}
+    details: dict[str, Any] = {}
+    if date_value:
+        details["date_iso"] = date_value.date().isoformat()
+        details["timezone"] = "Europe/Paris"
     if has_date and not has_time:
         details["missing_time"] = True
     if has_time and not has_date:
@@ -1269,6 +1381,9 @@ def _extract_date(text: str, now: datetime) -> datetime | None:
         return now
     if "tomorrow" in lowered:
         return now + timedelta(days=1)
+    explicit_month_day = _extract_explicit_month_day(lowered, now)
+    if explicit_month_day:
+        return explicit_month_day
     day_number = _extract_day_number(lowered)
     month_number = _extract_month_number(lowered)
     if day_number and month_number:
@@ -1309,8 +1424,39 @@ def _extract_date(text: str, now: datetime) -> datetime | None:
     return None
 
 
-def _extract_month_number(text: str) -> int | None:
-    months = {
+def _extract_explicit_month_day(text: str, now: datetime) -> datetime | None:
+    months = _month_lookup()
+    month_re = "|".join(sorted((re.escape(name) for name in months), key=len, reverse=True))
+    day_re = r"([12]?\d|3[01])(?:st|nd|rd|th)?"
+    patterns = [
+        rf"\b({month_re})\s+{day_re}(?:,?\s*(20\d{{2}}))?\b",
+        rf"\b{day_re}\s+(?:of\s+)?({month_re})(?:,?\s*(20\d{{2}}))?\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        groups = match.groups()
+        if groups[0].isdigit():
+            day = int(groups[0])
+            month = months[groups[1]]
+            year = int(groups[2]) if groups[2] else now.year
+        else:
+            month = months[groups[0]]
+            day = int(groups[1])
+            year = int(groups[2]) if groups[2] else now.year
+        try:
+            candidate = now.replace(year=year, month=month, day=day)
+        except ValueError:
+            return None
+        if not any(group and re.fullmatch(r"20\d{2}", group) for group in groups) and candidate.date() < now.date():
+            candidate = candidate.replace(year=year + 1)
+        return candidate
+    return None
+
+
+def _month_lookup() -> dict[str, int]:
+    return {
         "january": 1,
         "jan": 1,
         "february": 2,
@@ -1336,6 +1482,10 @@ def _extract_month_number(text: str) -> int | None:
         "december": 12,
         "dec": 12,
     }
+
+
+def _extract_month_number(text: str) -> int | None:
+    months = _month_lookup()
     for name, value in sorted(months.items(), key=lambda item: len(item[0]), reverse=True):
         if re.search(rf"\b{re.escape(name)}\b", text):
             return value
@@ -1709,12 +1859,55 @@ def _trusted_caller_phone(phone: str | None) -> str | None:
     return normalized if status == "complete" else None
 
 
-def _booking_sms_body(result: dict[str, Any], *, fallback: str) -> str:
+def _booking_sms_body(result: dict[str, Any], *, fallback: str, knowledge_base: str | None = None) -> str:
     booking = result.get("booking") or {}
     start = _friendly_datetime(str(booking.get("start_iso") or ""))
+    address = _property_address_from_kb(knowledge_base)
     if start != "that time":
-        return f"Your viewing is confirmed for {start}."
-    return fallback
+        body = f"Your viewing is confirmed for {start}."
+    else:
+        body = fallback.rstrip(".") + "."
+    if address:
+        return f"{body} Address: {address}."
+    return f"{body} An agent will send the address an hour before the viewing."
+
+
+def _property_details_sms_body(knowledge_base: str | None, *, fallback: str) -> str:
+    snippet = _property_details_from_kb(knowledge_base)
+    if snippet:
+        return f"Property details: {snippet}"
+    return fallback[:220] or "Thanks for calling. An agent will send the property details here shortly."
+
+
+def _property_details_from_kb(knowledge_base: str | None) -> str | None:
+    if not knowledge_base:
+        return None
+    lines = [
+        re.sub(r"\s+", " ", line.strip(" -#*\t"))
+        for line in knowledge_base.splitlines()
+        if line.strip(" -#*\t")
+    ]
+    if not lines:
+        return None
+    useful = [
+        line
+        for line in lines
+        if not re.search(r"\b(system prompt|instruction|agent|assistant)\b", line, re.I)
+    ][:8]
+    text = " | ".join(useful).strip()
+    return text[:900] if text else None
+
+
+def _property_address_from_kb(knowledge_base: str | None) -> str | None:
+    if not knowledge_base:
+        return None
+    for line in knowledge_base.splitlines():
+        cleaned = re.sub(r"\s+", " ", line.strip(" -#*\t"))
+        match = re.search(r"\b(address|meeting address|viewing address|location)\s*[:\-]\s*(.+)", cleaned, re.I)
+        if match:
+            value = match.group(2).strip()
+            return value[:180] if value else None
+    return None
 
 
 def _friendly_datetime(value: str) -> str:
