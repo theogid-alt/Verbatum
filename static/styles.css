@@ -301,6 +301,26 @@ h2 {
   resize: vertical;
 }
 
+.evaluation-note-row {
+  display: grid;
+  gap: 7px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+}
+
+.evaluation-note-row button,
+.evaluation-notes-head button {
+  min-height: 34px;
+  white-space: nowrap;
+}
+
+.evaluation-notes-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+
 .evaluation-notes-label {
   color: var(--muted);
   font-size: 12px;

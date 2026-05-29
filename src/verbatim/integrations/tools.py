@@ -947,6 +947,8 @@ def _calendar_action_from_text(*, latest_text: str, recent_text: str) -> dict[st
             "tool_name": "cancel_calendar_booking",
             "arguments": {},
         }
+    if _blocks_booking_or_viewing(latest):
+        return None
     if _asks_booking_status(latest) and not _asks_to_create_booking(latest):
         return None
     if _asks_for_viewing_without_slot(latest):
@@ -1411,6 +1413,31 @@ def _is_property_info_only_turn(text: str) -> bool:
         re.search(r"\b(property|properties|listing|listings|home|house|villa|apartment|flat)\b", lowered)
         and re.search(r"\b(details|info|information|price|financing|mortgage|term|interest|address|link|other|similar|options|tell me|more)\b", lowered)
     )
+
+
+def _blocks_booking_or_viewing(text: str) -> bool:
+    lowered = text.lower()
+    negative_booking = bool(
+        re.search(
+            r"\b(do not|don'?t|dont|no need to|not yet|not now|hold off|wait|pause|not ready)\b.{0,50}"
+            r"\b(book|booking|schedule|viewing|visit|tour|appointment)\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(book|booking|schedule|viewing|visit|tour|appointment)\b.{0,50}"
+            r"\b(do not|don'?t|dont|not yet|not now|hold off|wait|pause|not ready)\b",
+            lowered,
+        )
+    )
+    info_first = bool(
+        re.search(r"\b(before|prior to|first)\b.{0,80}\b(book|booking|viewing|visit|tour|appointment)\b", lowered)
+        and re.search(r"\b(info|information|details|price|financing|mortgage|agent|person|human|advisor)\b", lowered)
+    )
+    explicit_person_first = bool(
+        re.search(r"\b(i need|need|want|speak to|talk to)\b.{0,60}\b(agent|person|human|advisor|someone)\b", lowered)
+        and re.search(r"\b(before|to even|first|instead of)\b|(?:\bnot\b.{0,20}\b(book|view|visit))", lowered)
+    )
+    return negative_booking or info_first or explicit_person_first
 
 
 def _asks_to_repeat_suggested_slot(text: str) -> bool:
@@ -2007,11 +2034,8 @@ def _property_address_sms_body(knowledge_base: str | None, *, fallback: str) -> 
 def _property_details_from_kb(knowledge_base: str | None) -> str | None:
     if not knowledge_base:
         return None
-    lines = [
-        re.sub(r"\s+", " ", line.strip(" -#*\t"))
-        for line in knowledge_base.splitlines()
-        if line.strip(" -#*\t")
-    ]
+    lines = [_clean_property_kb_line(line) for line in knowledge_base.splitlines()]
+    lines = [line for line in lines if line]
     if not lines:
         return None
     useful = [
@@ -2019,7 +2043,7 @@ def _property_details_from_kb(knowledge_base: str | None) -> str | None:
         for line in lines
         if not re.search(r"\b(system prompt|instruction|agent|assistant)\b", line, re.I)
     ][:8]
-    text = " | ".join(useful).strip()
+    text = "; ".join(useful).strip()
     return text[:900] if text else None
 
 
@@ -2033,6 +2057,26 @@ def _property_address_from_kb(knowledge_base: str | None) -> str | None:
             value = match.group(2).strip()
             return value[:180] if value else None
     return None
+
+
+def _clean_property_kb_line(line: str) -> str:
+    cleaned = re.sub(r"\s+", " ", line.strip(" -#*\t,{}[]"))
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r'^[\'"]?([A-Za-z][\w\s/-]{1,40})[\'"]?\s*[:=]\s*[\'"]?(.+?)[\'"]?[,]?$', r"\1: \2", cleaned)
+    cleaned = cleaned.replace('\\"', '"').replace("\\'", "'")
+    cleaned = re.sub(r'["{}[\]]', "", cleaned)
+    cleaned = re.sub(r"\s*[,|]\s*$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    if not cleaned:
+        return ""
+    key_match = re.match(r"([A-Za-z][\w\s/-]{1,40}):\s*(.+)", cleaned)
+    if key_match:
+        key = key_match.group(1).replace("_", " ").strip().title()
+        value = key_match.group(2).strip(" ,.")
+        if value:
+            return f"{key}: {value}"
+    return cleaned
 
 
 def _friendly_datetime(value: str) -> str:

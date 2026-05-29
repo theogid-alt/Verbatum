@@ -76,7 +76,8 @@ const evaluationVersionSummary = $("#evaluationVersionSummary");
 const evaluationAutoMetrics = $("#evaluationAutoMetrics");
 const evaluationFields = $("#evaluationFields");
 const evaluationNotesInput = $("#evaluationNotesInput");
-const DEFAULT_EVALUATION_VERSION = "v0.3.1";
+const dictateEvaluationNotesButton = $("#dictateEvaluationNotesButton");
+const DEFAULT_EVALUATION_VERSION = "v0.3.2";
 const toolsEnabledInput = $("#toolsEnabledInput");
 const integrationStatusButton = $("#integrationStatusButton");
 const integrationStatusLine = $("#integrationStatusLine");
@@ -1147,16 +1148,64 @@ function renderEvaluationFields(rubric, savedScores) {
         <option value="2">2 · Needs attention</option>
         <option value="1">1 · Failed</option>
       </select>
-      <textarea rows="2" data-eval-note="${escapeHtml(field.id)}" placeholder="Optional note for ${escapeHtml(field.label)}"></textarea>
+      <div class="evaluation-note-row">
+        <textarea rows="2" data-eval-note="${escapeHtml(field.id)}" placeholder="Optional note for ${escapeHtml(field.label)}"></textarea>
+        <button type="button" data-eval-dictate="${escapeHtml(field.id)}">Dictate</button>
+      </div>
     `;
     const select = article.querySelector("select");
     const note = article.querySelector("textarea");
+    const dictateButton = article.querySelector("button");
     select.value = saved.score ? String(saved.score) : "";
     note.value = saved.notes || "";
     select.addEventListener("change", updateEvaluationPreview);
     note.addEventListener("input", updateEvaluationPreview);
+    dictateButton.addEventListener("click", () => startEvaluationDictation(note, dictateButton));
+    if (!speechRecognitionConstructor()) {
+      dictateButton.disabled = true;
+      dictateButton.title = "Browser dictation is not available here. Use macOS dictation instead.";
+    }
     evaluationFields.appendChild(article);
   });
+}
+
+function speechRecognitionConstructor() {
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
+function startEvaluationDictation(textarea, button) {
+  const Recognition = speechRecognitionConstructor();
+  if (!Recognition) {
+    evaluationStatusLine.textContent = "Browser dictation is not available here. Use macOS dictation instead.";
+    return;
+  }
+  const recognition = new Recognition();
+  recognition.lang = navigator.language || "en-US";
+  recognition.continuous = false;
+  recognition.interimResults = false;
+  const originalText = button.textContent;
+  button.textContent = "Listening";
+  button.disabled = true;
+  recognition.onresult = (event) => {
+    const transcript = Array.from(event.results || [])
+      .map((result) => result?.[0]?.transcript || "")
+      .join(" ")
+      .trim();
+    if (!transcript) return;
+    const current = textarea.value.trim();
+    textarea.value = current ? `${current} ${transcript}` : transcript;
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    evaluationStatusLine.textContent = "Dictation added to the evaluation.";
+  };
+  recognition.onerror = (event) => {
+    evaluationStatusLine.textContent = `Dictation stopped: ${event.error || "unknown error"}`;
+    log("Evaluation dictation failed", { error: event.error || "unknown" });
+  };
+  recognition.onend = () => {
+    button.textContent = originalText;
+    button.disabled = false;
+  };
+  recognition.start();
 }
 
 function evaluationPayloadFromForm() {
@@ -1396,6 +1445,11 @@ saveEvaluationButton.addEventListener("click", () => saveEvaluation().catch((err
 }));
 
 evaluationNotesInput.addEventListener("input", updateEvaluationPreview);
+dictateEvaluationNotesButton.addEventListener("click", () => startEvaluationDictation(evaluationNotesInput, dictateEvaluationNotesButton));
+if (!speechRecognitionConstructor()) {
+  dictateEvaluationNotesButton.disabled = true;
+  dictateEvaluationNotesButton.title = "Browser dictation is not available here. Use macOS dictation instead.";
+}
 evaluationVersionInput.addEventListener("change", () => {
   evaluationVersionInput.value = sanitizeBotVersion(evaluationVersionInput.value || DEFAULT_EVALUATION_VERSION);
   refreshEvaluationVersionSummary();

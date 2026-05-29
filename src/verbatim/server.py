@@ -55,7 +55,7 @@ def create_app():
     from fastapi.responses import HTMLResponse
     from fastapi.staticfiles import StaticFiles
 
-    app = FastAPI(title="Verbatim V2 Voice Agent", version="0.3.1")
+    app = FastAPI(title="Verbatim V2 Voice Agent", version="0.3.2")
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/", response_class=HTMLResponse)
@@ -68,7 +68,7 @@ def create_app():
         settings = get_settings()
         return {
             "ok": True,
-            "version": "0.3.1",
+            "version": "0.3.2",
             "environment": settings.agent.environment,
             "active_agents": _active_agent_count(),
         }

@@ -1671,7 +1671,7 @@ wheels = [
 
 [[package]]
 name = "verbatim-voice-pipeline"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

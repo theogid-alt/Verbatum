@@ -530,6 +530,26 @@ def test_property_details_sms_body_uses_kb_when_available():
     assert "12 Palm Road" in body
 
 
+def test_property_details_sms_body_cleans_json_like_kb():
+    body = _property_details_sms_body(
+        """
+        {
+          "name": "Palm View 506",
+          "price": "250000 EUR",
+          "address": "12 Palm Road",
+          "notes": "Sea view"
+        }
+        """,
+        fallback="An agent will follow up.",
+    )
+
+    assert "Name: Palm View 506" in body
+    assert "Price: 250000 EUR" in body
+    assert "Address: 12 Palm Road" in body
+    assert "{" not in body
+    assert '"' not in body
+
+
 def test_property_address_sms_body_can_send_address_only():
     body = _property_address_sms_body("Property 506\nAddress: 12 Palm Road", fallback="Follow up later.")
 
@@ -731,6 +751,17 @@ def test_calendar_action_does_not_reuse_stale_booking_context_for_unrelated_turn
     )
 
     assert action is None
+
+
+def test_calendar_action_does_not_book_when_user_explicitly_needs_info_first():
+    assert _calendar_action_from_text(
+        latest_text="Do not book a viewing. I need a real estate agent to explain the financing first.",
+        recent_text="The property is interesting. Do not book a viewing. I need a real estate agent to explain the financing first.",
+    ) is None
+    assert _calendar_action_from_text(
+        latest_text="I am not ready to book yet, I need more details before a visit.",
+        recent_text="I am not ready to book yet, I need more details before a visit.",
+    ) is None
 
 
 def test_calendar_action_does_not_rebook_when_user_says_already_booked():
