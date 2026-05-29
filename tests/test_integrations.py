@@ -25,7 +25,9 @@ from verbatim.integrations.tools import (
     _followup_action_from_text,
     _followup_response_text,
     _merge_phone_fragments,
+    _property_address_sms_body,
     _property_details_sms_body,
+    _suggested_slot_repeat_response,
     _suggested_booking_action,
     _validate_phone,
     SchedulingToolRuntime,
@@ -528,6 +530,12 @@ def test_property_details_sms_body_uses_kb_when_available():
     assert "12 Palm Road" in body
 
 
+def test_property_address_sms_body_can_send_address_only():
+    body = _property_address_sms_body("Property 506\nAddress: 12 Palm Road", fallback="Follow up later.")
+
+    assert body == "Property address: 12 Palm Road"
+
+
 def test_booking_sms_body_includes_address_or_safe_address_followup():
     result = {"booking": {"start_iso": "2026-06-26T19:00:00+02:00"}}
 
@@ -635,6 +643,30 @@ def test_calendar_action_suggests_slots_when_user_wants_to_visit_without_time():
 
     assert action
     assert action["tool_name"] == "check_calendar_availability"
+
+
+def test_calendar_action_ignores_property_info_only_questions():
+    action = _calendar_action_from_text(
+        latest_text="Tell me about other similar properties.",
+        recent_text="Tell me about other similar properties.",
+    )
+
+    assert action is None
+
+
+def test_repeat_suggested_slot_does_not_accept_or_book():
+    action = _suggested_booking_action(
+        {
+            "slots": [
+                {"start_iso": "2026-05-30T09:00:00+02:00", "end_iso": "2026-05-30T09:30:00+02:00"}
+            ],
+            "outcome": "available_slots",
+        }
+    )
+
+    assert action
+    assert not _accepts_suggested_slot("Can you repeat the date?", recent_tail="I can do Saturday at 9.")
+    assert "Saturday May 30 at 9 AM" in _suggested_slot_repeat_response(action)
 
 
 def test_calendar_responses_frame_bookings_as_property_viewings():

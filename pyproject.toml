@@ -1,6 +1,6 @@
 [project]
 name = "verbatim-voice-pipeline"
-version = "0.3.0"
+version = "0.3.1"
 description = "Verbatim v2 WebRTC voice-agent baseline using Daily/LiveKit Pipecat cascades and Hume comparison."
 readme = "README.md"
 requires-python = ">=3.11,<3.12"

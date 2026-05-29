@@ -438,6 +438,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             self.last_booking_id: str | None = None
             self.last_suggested_action: dict[str, Any] | None = None
             self.pending_sms_body: str | None = None
+            self.last_confirmable_sms_body: str | None = None
             self.last_sms_response: str | None = None
             self.awaiting_sms_offer_response = False
             self.pending_booking_fragments: list[str] = []
@@ -465,6 +466,23 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             if sms_result:
                 if turn_id:
                     handled_turns.add(turn_id)
+                return
+
+            if self.last_suggested_action and _asks_to_repeat_suggested_slot(latest_text):
+                if turn_id:
+                    handled_turns.add(turn_id)
+                recorder.emit(
+                    "tool.direct.skipped",
+                    provider="tool",
+                    metadata={
+                        "client_id": client_id,
+                        "outcome": "suggested_slot_repeated",
+                        "tool_name": "check_calendar_availability",
+                        "text_preview": latest_text[:160],
+                    },
+                    once_per_turn=True,
+                )
+                await self._push_response(_suggested_slot_repeat_response(self.last_suggested_action), direction)
                 return
 
             status_response = _booking_status_response(
@@ -639,6 +657,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 )
                 if runtime.caller_phone:
                     self.awaiting_sms_offer_response = True
+                    self.last_confirmable_sms_body = self.pending_sms_body
                     response_text = f"{booking_response} Want me to text you the viewing confirmation?"
                 else:
                     self.pending_sms_body = None
@@ -648,6 +667,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 self.last_booking_id = None
                 self.last_suggested_action = None
                 self.pending_sms_body = None
+                self.last_confirmable_sms_body = None
                 self.last_sms_response = None
                 self.awaiting_sms_offer_response = False
             await self._push_response(response_text, direction)
@@ -673,6 +693,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
         async def _handle_sms_followup_turn(self, *, latest_text: str, recent_tail: str, direction: FrameDirection) -> bool:
             wants_sms = _asks_for_sms_followup(latest_text)
             asks_sms_status = _asks_sms_status(latest_text)
+            message_kind = _sms_message_kind(latest_text)
             if asks_sms_status and self.last_sms_response:
                 await self._push_response(self.last_sms_response, direction)
                 return True
@@ -697,7 +718,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             sms_body = self.pending_sms_body or self.last_booking_response or settings.integrations.followup_sms_default_body
             if self.pending_sms_body and self.awaiting_sms_offer_response:
                 if _rejects_confirmation(latest_text):
-                    self.pending_sms_body = None
+                    self.last_confirmable_sms_body = self.pending_sms_body
                     self.awaiting_sms_offer_response = False
                     await self._push_response("No problem.", direction)
                     return True
@@ -706,6 +727,23 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                     return True
                 return False
             if wants_sms or asks_sms_status:
+                if message_kind == "address":
+                    await self._send_property_address_sms(latest_text=latest_text, recent_tail=recent_tail, direction=direction)
+                    return True
+                if self.last_confirmable_sms_body and _asks_to_send_previous_sms(latest_text):
+                    await self._send_sms_confirmation(
+                        sms_body=self.last_confirmable_sms_body,
+                        latest_text=latest_text,
+                        direction=direction,
+                    )
+                    return True
+                if message_kind == "property_details":
+                    await self._send_property_details_sms(
+                        latest_text=latest_text,
+                        recent_tail=recent_tail,
+                        direction=direction,
+                    )
+                    return True
                 if not self.pending_sms_body and not self.last_booking_response:
                     if wants_sms:
                         await self._send_property_details_sms(
@@ -766,6 +804,38 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 self.last_sms_response = "Yes, I sent the property details."
             await self._push_response(response_text, direction)
 
+        async def _send_property_address_sms(self, *, latest_text: str, recent_tail: str, direction: FrameDirection) -> None:
+            action = {
+                "tool_name": "send_sms_followup",
+                "arguments": {
+                    "body": _property_address_sms_body(
+                        getattr(session, "knowledge_base", None),
+                        fallback="An agent will send the property address here shortly.",
+                    ),
+                    "channel": "sms",
+                    "message_kind": "property_address",
+                },
+            }
+            recorder.emit(
+                "tool.direct.activated",
+                provider="tool",
+                metadata={
+                    "client_id": client_id,
+                    **_tool_integration_metadata(settings, "send_sms_followup"),
+                    "tool_name": "send_sms_followup",
+                    "caller_phone_configured": bool(runtime.caller_phone),
+                    "direct_tool": True,
+                    "message_kind": "property_address",
+                    "text_preview": f"{recent_tail} {latest_text}".strip()[:160],
+                },
+                once_per_turn=True,
+            )
+            result = await _run_followup_action(runtime, action)
+            response_text = _followup_response_text(action, result)
+            if result.get("ok"):
+                self.last_sms_response = "Yes, I sent the address."
+            await self._push_response(response_text, direction)
+
         async def _push_unavailable_calendar_response(self, *, action: dict[str, Any], latest_text: str, direction: FrameDirection) -> None:
             metadata = {
                 "client_id": client_id,
@@ -808,6 +878,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             response_text = _followup_response_text(action, result)
             if result.get("ok"):
                 self.pending_sms_body = None
+                self.last_confirmable_sms_body = None
                 self.awaiting_sms_offer_response = False
                 self.last_sms_response = "Yes, I sent the viewing confirmation."
             await self._push_response(response_text, direction)
@@ -869,6 +940,8 @@ def _calendar_action_from_text(*, latest_text: str, recent_text: str) -> dict[st
     latest = _normalize_stuttered_words(latest_text.lower())
     combined = _normalize_stuttered_words(recent_text.strip())
     lowered = combined.lower()
+    if _is_property_info_only_turn(latest):
+        return None
     if _asks_to_cancel_calendar(latest):
         return {
             "tool_name": "cancel_calendar_booking",
@@ -1059,6 +1132,8 @@ def _followup_response_text(action: dict[str, Any], result: dict[str, Any]) -> s
     if result.get("ok"):
         if outcome == "email_sent":
             return "Done, I sent the email."
+        if message_kind == "property_address":
+            return "Done, I sent the address."
         if message_kind == "property_details":
             return "Done, I sent the property details."
         return "Done, I sent the viewing confirmation."
@@ -1224,11 +1299,26 @@ def _asks_for_sms_followup(text: str) -> bool:
     return bool(
         re.search(
             r"\b(text me|send (?:me )?(?:a )?(?:text|sms|message)|send it by text|message me|"
+            r"actually send it|send it|send that|send me that|"
             r"send (?:me )?(?:the )?(?:confirmation|details|options|info|information|link|property details|property link)|"
             r"confirmation text)\b",
             lowered,
         )
     )
+
+
+def _asks_to_send_previous_sms(text: str) -> bool:
+    lowered = text.lower()
+    return bool(re.search(r"\b(actually )?(send it|send that|send me that|text it|message it|send the confirmation)\b", lowered))
+
+
+def _sms_message_kind(text: str) -> str:
+    lowered = text.lower()
+    if re.search(r"\b(address|location|where (?:do|should) (?:i|we) meet|where is it|where to meet)\b", lowered):
+        return "address"
+    if re.search(r"\b(property details|details|info|information|options|link|listing|send me that)\b", lowered):
+        return "property_details"
+    return "viewing_confirmation"
 
 
 def _asks_sms_status(text: str) -> bool:
@@ -1248,7 +1338,7 @@ def _rejects_confirmation(text: str) -> bool:
 
 def _accepts_suggested_slot(text: str, *, recent_tail: str = "") -> bool:
     combined = f"{recent_tail} {text}".lower()
-    if re.search(r"\b(no|nope|not yet|wait|hold on|don'?t|do not|wrong|cancel|never mind|nevermind)\b", combined):
+    if re.search(r"\b(no|nope|not yet|wait|hold on|don'?t|do not|wrong|cancel|never mind|nevermind|repeat|say that again|what (?:day|date|time))\b", combined):
         return False
     return bool(
         re.search(
@@ -1311,6 +1401,34 @@ def _asks_for_viewing_without_slot(text: str) -> bool:
         re.search(r"\b(visit|view|see|come by|tour)\b", lowered)
         and re.search(r"\b(property|home|house|villa|apartment|flat|listing|one|it)\b", lowered)
     )
+
+
+def _is_property_info_only_turn(text: str) -> bool:
+    lowered = text.lower()
+    if re.search(r"\b(calendar|book|booking|appointment|viewing|visit|tour|come by|schedule|slot|time)\b", lowered):
+        return False
+    return bool(
+        re.search(r"\b(property|properties|listing|listings|home|house|villa|apartment|flat)\b", lowered)
+        and re.search(r"\b(details|info|information|price|financing|mortgage|term|interest|address|link|other|similar|options|tell me|more)\b", lowered)
+    )
+
+
+def _asks_to_repeat_suggested_slot(text: str) -> bool:
+    lowered = text.lower()
+    return bool(
+        re.search(
+            r"\b(repeat|say that again|what (?:day|date|time)|which (?:day|date|time)|when was that|"
+            r"what did you (?:say|suggest|offer))\b",
+            lowered,
+        )
+    )
+
+
+def _suggested_slot_repeat_response(action: dict[str, Any]) -> str:
+    start = _friendly_datetime(str((action.get("arguments") or {}).get("start_iso") or ""))
+    if start == "that time":
+        return "I suggested that viewing slot."
+    return f"I suggested {start}."
 
 
 def _asks_to_book(text: str) -> bool:
@@ -1877,6 +1995,13 @@ def _property_details_sms_body(knowledge_base: str | None, *, fallback: str) -> 
     if snippet:
         return f"Property details: {snippet}"
     return fallback[:220] or "Thanks for calling. An agent will send the property details here shortly."
+
+
+def _property_address_sms_body(knowledge_base: str | None, *, fallback: str) -> str:
+    address = _property_address_from_kb(knowledge_base)
+    if address:
+        return f"Property address: {address}"
+    return fallback[:220] or "An agent will send the property address here shortly."
 
 
 def _property_details_from_kb(knowledge_base: str | None) -> str | None:
