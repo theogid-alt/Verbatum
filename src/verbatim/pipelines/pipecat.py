@@ -81,6 +81,9 @@ class PipelineRecorder:
         self.recent_user_texts: list[str] = []
         self.calendar_booking_confirmed = False
         self.sms_followup_sent = False
+        self.tool_transactions: dict[str, dict[str, Any]] = {}
+        self.latest_tool_transaction_by_name: dict[str, str] = {}
+        self.successful_tool_transactions_by_name: dict[str, list[str]] = {}
 
     @property
     def llm_provider(self) -> str:
@@ -110,6 +113,11 @@ class PipelineRecorder:
         return self.sink.emit(event_name, provider=provider, turn_id=resolved_turn_id, metadata=metadata or {})
 
     def _track_tool_truth_state(self, event_name: str, metadata: dict[str, Any]) -> None:
+        if event_name == "tool.call.completed":
+            tool_name = str(metadata.get("tool_name") or "")
+            transaction_id = str(metadata.get("tool_transaction_id") or "")
+            if transaction_id:
+                self.successful_tool_transactions_by_name.setdefault(tool_name, []).append(transaction_id)
         if event_name != "tool.call.completed":
             return
         tool_name = str(metadata.get("tool_name") or "")
@@ -117,6 +125,50 @@ class PipelineRecorder:
             self.calendar_booking_confirmed = True
         if tool_name == "send_sms_followup" and metadata.get("sms_sent"):
             self.sms_followup_sent = True
+
+    def start_tool_transaction(self, tool_name: str, arguments: dict[str, Any] | None = None) -> str:
+        transaction_id = f"tooltx_{uuid.uuid4().hex[:12]}"
+        metadata = {
+            "tool_transaction_id": transaction_id,
+            "tool_name": tool_name,
+            "tool_status": "requested",
+            "tool_arguments": _safe_tool_arguments(arguments or {}),
+        }
+        self.tool_transactions[transaction_id] = {
+            **metadata,
+            "started_at_monotonic_ms": round(time.monotonic() * 1000, 3),
+        }
+        self.latest_tool_transaction_by_name[tool_name] = transaction_id
+        self.emit("tool.transaction.updated", provider="tool", metadata=metadata)
+        return transaction_id
+
+    def update_tool_transaction(
+        self,
+        transaction_id: str | None,
+        *,
+        status: str,
+        outcome: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if not transaction_id:
+            return
+        transaction = self.tool_transactions.get(transaction_id)
+        if not transaction:
+            return
+        tool_name = str(transaction.get("tool_name") or "")
+        payload = {
+            "tool_transaction_id": transaction_id,
+            "tool_name": tool_name,
+            "tool_status": status,
+            **(metadata or {}),
+        }
+        if outcome:
+            payload["outcome"] = outcome
+        transaction.update(payload)
+        self.emit("tool.transaction.updated", provider="tool", metadata=payload)
+
+    def tool_succeeded(self, tool_name: str) -> bool:
+        return bool(self.successful_tool_transactions_by_name.get(tool_name))
 
     def next_turn(self) -> str:
         self.turn_index += 1
@@ -319,7 +371,7 @@ async def _run_cascade_pipeline(settings, session, recorder, Pipeline, PipelineR
     tts = _build_tts(settings, recorder, CartesiaTTSService, TextAggregationMode)
     context = LLMContext(messages=_session_context_messages(session.system_prompt or settings.prompt.system_prompt, session))
     tools_schema = None
-    if session.tools_enabled:
+    if session.tools_enabled and settings.providers.llm_provider != "groq":
         from verbatim.integrations.tools import configure_scheduling_tools
 
         tools_schema = configure_scheduling_tools(settings, session, recorder, llm, context)
@@ -332,6 +384,20 @@ async def _run_cascade_pipeline(settings, session, recorder, Pipeline, PipelineR
                 "integration_provider": "verbatim",
                 "integration_key": "safe-tool-surface",
                 "activation": "calendar_and_followup_turns_only",
+            },
+        )
+    elif session.tools_enabled:
+        recorder.emit(
+            "tool.schema.configured",
+            provider="tool",
+            metadata={
+                "client_id": session.client_id or settings.integrations.default_client_id,
+                "tools_enabled": True,
+                "schema_exposed_to_llm": False,
+                "direct_tool_router_enabled": True,
+                "integration_provider": "verbatim",
+                "integration_key": "safe-tool-surface",
+                "activation": "groq_direct_router_only",
             },
         )
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
@@ -480,7 +546,9 @@ def _llm_output_guard(recorder: PipelineRecorder, session: AgentSession):
 
 def _unverified_tool_claim_replacement(text: str, recorder: PipelineRecorder) -> str | None:
     lowered = text.lower()
-    if not recorder.calendar_booking_confirmed and re.search(
+    booking_succeeded = _recorder_tool_succeeded(recorder, "confirm_calendar_booking", "calendar_booking_confirmed")
+    sms_succeeded = _recorder_tool_succeeded(recorder, "send_sms_followup", "sms_followup_sent")
+    if not booking_succeeded and re.search(
         r"\b(hang up|end (?:the )?call|after (?:the )?call|once (?:we|you) (?:hang up|end)|later)\b.*"
         r"\b(book|schedule|arrange|set up|add).*\b(viewing|appointment|booking|calendar)\b|"
         r"\b(i'?ll|i will|we'?ll|we will|going to|gonna)\b.*"
@@ -488,29 +556,62 @@ def _unverified_tool_claim_replacement(text: str, recorder: PipelineRecorder) ->
         lowered,
     ):
         return "I can only book it here once I have the exact day and time."
-    if not recorder.sms_followup_sent and re.search(
+    if not sms_succeeded and re.search(
+        r"\b(hang up|end (?:the )?call|after (?:the )?call|once (?:we|you) (?:hang up|end)|later)\b.*"
+        r"\b(send|text|message|email).*\b(details|info|property|address|link)\b|"
+        r"\b(i'?ll|i will|we'?ll|we will|going to|gonna)\b.*"
+        r"\b(send|text|message|email).*\b(details|info|property|address|link)\b",
+        lowered,
+    ):
+        return "I can send that once I know which property."
+    if not sms_succeeded and re.search(
+        r"\b(i'?ll|i will|we'?ll|we will|going to|gonna|let me|i can)\b.*"
+        r"\b(send|text|message).*\b(details|info|information|property|address|link|options)\b|"
+        r"\b(you'?ll|you will|you should)\b.*\b(receive|get|have)\b.*"
+        r"\b(details|info|information|property|address|link|options|sms|text|message)\b",
+        lowered,
+    ):
+        return "I can send that by SMS once I know which property."
+    if not sms_succeeded and re.search(
         r"\b(hang up|end (?:the )?call|after (?:the )?call|once (?:we|you) (?:hang up|end)|later)\b.*"
         r"\b(send|text|message|email).*\b(confirmation|sms|text|message|email)\b|"
         r"\b(i'?ll|i will|we'?ll|we will|going to|gonna)\b.*"
         r"\b(send|text|message|email).*\b(confirmation|sms|text|message|email)\b",
         lowered,
     ):
-        if recorder.calendar_booking_confirmed:
+        if booking_succeeded:
             return "Want me to text you the viewing confirmation?"
         return "I can only send an SMS confirmation after the viewing is booked."
-    if not recorder.calendar_booking_confirmed and re.search(
+    if not sms_succeeded and re.search(
+        r"\b(sent|texted|messaged)\b.*\b(details|info|property|address|link)\b|"
+        r"\b(details|info|property|address|link)\b.*\b(sent|texted|messaged)\b|"
+        r"\b(done|all set)\b.*\b(details|info|property|address|link|sms|text|message)\b",
+        lowered,
+    ):
+        return "I have not sent that SMS yet."
+    if not booking_succeeded and re.search(
         r"\b(done|confirmed|scheduled|booked|added)\b.*\b(viewing|appointment|calendar|booking)\b|"
         r"\b(viewing|appointment|booking)\b.*\b(done|confirmed|scheduled|booked|added)\b",
         lowered,
     ):
         return "I need to check the calendar before I can confirm that."
-    if not recorder.sms_followup_sent and re.search(
+    if not sms_succeeded and re.search(
         r"\b(sent|texted|messaged)\b.*\b(sms|text|message|confirmation)\b|"
-        r"\b(sms|text|message|confirmation)\b.*\b(sent|texted|messaged)\b",
+        r"\b(sms|text|message|confirmation)\b.*\b(sent|texted|messaged)\b|"
+        r"\b(done|all set)\b.*\b(sms|text|message|confirmation)\b",
         lowered,
     ):
         return "I have not sent the SMS yet."
     return None
+
+
+def _recorder_tool_succeeded(recorder: PipelineRecorder, tool_name: str, fallback_attr: str) -> bool:
+    try:
+        if hasattr(recorder, "tool_succeeded") and recorder.tool_succeeded(tool_name):
+            return True
+    except Exception:
+        pass
+    return bool(getattr(recorder, fallback_attr, False))
 
 
 def _build_transport(settings: Settings, session: AgentSession):
@@ -887,6 +988,25 @@ def _frame_text(frame: Any) -> str:
         if value:
             return str(value)
     return ""
+
+
+def _safe_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    safe_keys = {
+        "date_iso",
+        "start_iso",
+        "end_iso",
+        "timezone",
+        "duration_minutes",
+        "title",
+        "channel",
+        "message_kind",
+        "pending_booking_id",
+    }
+    return {
+        key: str(value)[:180] if not isinstance(value, (int, float, bool)) else value
+        for key, value in arguments.items()
+        if key in safe_keys and value not in {None, ""}
+    }
 
 
 def _setup_provider_log_redaction() -> None:

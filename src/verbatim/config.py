@@ -247,6 +247,7 @@ class SessionConfig:
     idle_timeout_seconds: int = 300
     user_turn_stop_timeout: float = 5.0
     llm_history_messages: int = 1
+    max_active_agents: int = 8
 
 
 @dataclass(frozen=True)
@@ -440,6 +441,7 @@ class Settings:
                 idle_timeout_seconds=_env_int(source, "VERBATIM_IDLE_TIMEOUT_SECONDS", 300) or 300,
                 user_turn_stop_timeout=_env_float(source, "VERBATIM_USER_TURN_STOP_TIMEOUT", 5.0) or 5.0,
                 llm_history_messages=_env_int(source, "VERBATIM_LLM_HISTORY_MESSAGES", 1) or 1,
+                max_active_agents=_env_int(source, "VERBATIM_MAX_ACTIVE_AGENTS", 8) or 8,
             ),
         )
 

@@ -108,6 +108,26 @@ llm_model
 
 The worker applies those overrides and runs `run_voice_agent(...)`.
 
+## Concurrent Call Lifecycle
+
+The old local safety rule was "one active agent globally." That protected early testing from orphaned bots, but it is not the production shape.
+
+The current lifecycle is:
+
+```text
+one call_id
+-> one room/session
+-> one isolated agent worker
+```
+
+Multiple calls can now run concurrently as separate workers, capped by:
+
+```text
+VERBATIM_MAX_ACTIVE_AGENTS
+```
+
+Starting the same `call_id` twice returns `already_running` and does not spawn a duplicate worker. Stopping from the dashboard targets the current call only. This keeps the worker isolation that made LiveKit stable while allowing future SIP/PBX tests with concurrent inbound calls.
+
 ## Current Pipeline Shape
 
 The cascade pipeline is:

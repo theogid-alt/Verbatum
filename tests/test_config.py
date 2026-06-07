@@ -44,6 +44,7 @@ def test_existing_env_keys_are_loaded():
             "VERBATIM_DEFAULT_CLIENT_ID": "client-a",
             "VERBATIM_TOOLS_ENABLED": "true",
             "VERBATIM_TOOL_TIMEOUT_MS": "2500",
+            "VERBATIM_MAX_ACTIVE_AGENTS": "6",
         }
     )
     assert settings.providers.livekit_url == "wss://example.livekit.cloud"
@@ -57,6 +58,7 @@ def test_existing_env_keys_are_loaded():
     assert settings.integrations.default_client_id == "client-a"
     assert settings.integrations.tools_enabled is True
     assert settings.integrations.tool_timeout_ms == 2500
+    assert settings.session.max_active_agents == 6
 
 
 def test_invalid_ultravox_daily_combo_is_rejected():

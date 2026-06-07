@@ -77,7 +77,12 @@ const evaluationAutoMetrics = $("#evaluationAutoMetrics");
 const evaluationFields = $("#evaluationFields");
 const evaluationNotesInput = $("#evaluationNotesInput");
 const dictateEvaluationNotesButton = $("#dictateEvaluationNotesButton");
-const DEFAULT_EVALUATION_VERSION = "v0.3.2";
+const refreshToolEvaluationButton = $("#refreshToolEvaluationButton");
+const toolEvaluationStatusLine = $("#toolEvaluationStatusLine");
+const toolEvaluationMetrics = $("#toolEvaluationMetrics");
+const toolFailureRanking = $("#toolFailureRanking");
+const toolInteractionList = $("#toolInteractionList");
+const DEFAULT_EVALUATION_VERSION = "v0.4";
 const toolsEnabledInput = $("#toolsEnabledInput");
 const integrationStatusButton = $("#integrationStatusButton");
 const integrationStatusLine = $("#integrationStatusLine");
@@ -106,6 +111,12 @@ function ms(value) {
   return value === null || value === undefined || Number.isNaN(Number(value))
     ? "n/a"
     : `${Math.round(Number(value))} ms`;
+}
+
+function pct(value) {
+  return value === null || value === undefined || Number.isNaN(Number(value))
+    ? "n/a"
+    : `${Number(value).toFixed(1)}%`;
 }
 
 async function postJson(url, payload = {}) {
@@ -360,6 +371,7 @@ async function startAgent() {
   const result = await postJson("/api/agent/start", requestPayload());
   log("Agent started", {
     call_id: result.call_id,
+    already_running: Boolean(result.already_running),
     transport: result.transport_provider,
     llm: `${result.llm_provider}/${result.llm_model}`,
     client_id: result.client_id,
@@ -1032,6 +1044,9 @@ async function refreshMetrics() {
     const callNotes = metricsCallId
       ? await fetch(`/api/analytics/call-notes?call_id=${encodeURIComponent(metricsCallId)}`).then((response) => response.json())
       : null;
+    const toolEvaluation = metricsCallId
+      ? await fetch(`/api/analytics/tool-evaluation?call_id=${encodeURIComponent(metricsCallId)}`).then((response) => response.json())
+      : await fetch("/api/analytics/tool-evaluation").then((response) => response.json());
     $("#metricAvg").textContent = ms(summary.avg_clean_perceived_latency_ms ?? summary.avg_perceived_latency_ms);
     $("#metricP95").textContent = ms(summary.p95_perceived_latency_ms);
     $("#metricStt").textContent = ms(summary.avg_stt_processing_ms ?? summary.avg_speech_to_transcript_ms);
@@ -1050,6 +1065,7 @@ async function refreshMetrics() {
       }
     }
     renderToolTerminalEvents(summary.latest_events || []);
+    renderToolEvaluation(toolEvaluation);
     const stats = summary.livekit_client_stats || {};
     $("#networkLine").textContent = stats.connection_state
       ? `network loss=${stats.inbound_packet_loss_pct ?? "n/a"}% jitter=${stats.jitter_ms ?? "n/a"}ms rtt=${stats.rtt_ms ?? "n/a"}ms`
@@ -1059,6 +1075,46 @@ async function refreshMetrics() {
   } catch (error) {
     log("Metrics failed", { error: error.message });
   }
+}
+
+function renderToolEvaluation(payload) {
+  if (!toolEvaluationMetrics) return;
+  const metrics = payload?.metrics || {};
+  const scenario = payload?.scenario_report || {};
+  const scenarioMetrics = scenario.metrics || {};
+  const cards = [
+    ["Selection", pct(metrics.tool_selection_accuracy_pct ?? scenarioMetrics.tool_selection_accuracy_pct)],
+    ["Params", pct(metrics.parameter_accuracy_pct ?? scenarioMetrics.parameter_accuracy_pct)],
+    ["Hallucinated", pct(metrics.hallucinated_success_rate_pct ?? scenarioMetrics.hallucinated_success_rate_pct)],
+    ["Exec fail", pct(metrics.tool_execution_failure_rate_pct ?? scenarioMetrics.tool_execution_failure_rate_pct)],
+    ["Booking", pct(metrics.booking_success_rate_pct ?? scenarioMetrics.booking_success_rate_pct)],
+    ["SMS", pct(metrics.sms_success_rate_pct ?? scenarioMetrics.sms_success_rate_pct)],
+    ["Scenarios", `${scenario.passed_count ?? 0}/${scenario.scenario_count ?? 0}`],
+    ["Scenario pass", pct(scenario.pass_rate_pct)],
+  ];
+  toolEvaluationStatusLine.textContent = `Call ${payload?.call_id || payload?.latest_call_id || "n/a"} · ${metrics.interaction_count || 0} traced interactions · ${scenario.failed_count || 0} scenario failures`;
+  toolEvaluationMetrics.innerHTML = cards
+    .map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`)
+    .join("");
+  const ranking = scenario.failure_source_ranking || [];
+  toolFailureRanking.innerHTML = ranking.length
+    ? ranking.map((item) => `
+      <div class="tool-eval-row">
+        <strong>${escapeHtml(item.source)} · ${escapeHtml(item.label)}</strong>
+        <span>${escapeHtml(item.count)} failures</span>
+      </div>`).join("")
+    : `<div class="tool-eval-row"><strong>No scenario failures</strong><span>All automated scenarios passed.</span></div>`;
+  const interactions = payload?.interactions || [];
+  toolInteractionList.innerHTML = interactions.slice(-8).reverse().map((item) => {
+    const result = item.execution_result || {};
+    const matched = item.assistant_response_matched_reality;
+    return `
+      <div class="tool-eval-row">
+        <strong>${escapeHtml(item.tool_selected || "unresolved")} · ${escapeHtml(item.parsed_intent || "n/a")}</strong>
+        <span>${escapeHtml((item.user_request || "").slice(0, 120))}</span>
+        <span>ok=${escapeHtml(result.ok ?? item.execution_succeeded ?? "n/a")} · outcome=${escapeHtml(result.outcome || "n/a")} · matched=${escapeHtml(matched === undefined ? "n/a" : matched)}</span>
+      </div>`;
+  }).join("") || `<div class="tool-eval-row"><strong>No traced interactions yet</strong><span>Run a tool call to populate this list.</span></div>`;
 }
 
 function renderCallNotes(notes) {
@@ -1290,8 +1346,13 @@ function renderToolTerminalEvents(events) {
       "tool.confirmation.required",
       "tool.confirmation.accepted",
       "tool.confirmation.rejected",
+      "tool.transaction.updated",
       "tool.direct.activated",
       "tool.direct.skipped",
+      "tool.intent.parsed",
+      "tool.intent.unresolved",
+      "tool.execution.result",
+      "tool.assistant.response",
     ];
     if (!visibleToolEvents.includes(eventName)) return;
     const metadata = event.metadata || {};
@@ -1305,12 +1366,51 @@ function renderToolTerminalEvents(events) {
       log("Tool direct action", { tool: toolName, ...facts });
       return;
     }
+    if (eventName === "tool.intent.parsed") {
+      log("Tool intent parsed", {
+        tool: toolName,
+        intent: metadata.parsed_intent || "n/a",
+        request: metadata.user_request || metadata.text_preview || "",
+        args: metadata.tool_arguments || {},
+      });
+      return;
+    }
+    if (eventName === "tool.intent.unresolved") {
+      log("Tool intent unresolved", {
+        intent: metadata.parsed_intent || "unresolved",
+        request: metadata.user_request || metadata.text_preview || "",
+      });
+      return;
+    }
+    if (eventName === "tool.execution.result") {
+      log("Tool execution result", {
+        tool: toolName,
+        outcome,
+        ok: metadata.tool_execution_succeeded ?? metadata.ok ?? null,
+        ...facts,
+      });
+      return;
+    }
+    if (eventName === "tool.assistant.response") {
+      log("Tool response reality", {
+        tool: toolName,
+        matched: metadata.assistant_response_matched_reality,
+        claimed_success: metadata.assistant_claimed_success,
+        reason: metadata.assistant_mismatch_reason || null,
+        response: metadata.text_preview || "",
+      });
+      return;
+    }
     if (eventName === "tool.direct.skipped") {
       log("Tool skipped", { tool: toolName, outcome, ...facts });
       return;
     }
     if (eventName === "tool.call.started") {
       log("Tool started", { tool: toolName });
+      return;
+    }
+    if (eventName === "tool.transaction.updated") {
+      log("Tool transaction", { tool: toolName, outcome, ...facts });
       return;
     }
     if (eventName === "tool.confirmation.required") {
@@ -1362,6 +1462,12 @@ function compactToolFacts(metadata) {
     "end_iso",
     "suggested_slot_count",
     "message_id",
+    "message_kind",
+    "tool_status",
+    "tool_transaction_id",
+    "tool_interaction_id",
+    "tool_execution_succeeded",
+    "assistant_response_matched_reality",
   ];
   return keys.reduce((result, key) => {
     if (metadata[key] !== undefined && metadata[key] !== null && metadata[key] !== "") {
@@ -1402,7 +1508,7 @@ joinButton.addEventListener("click", () => join().catch((error) => {
 leaveButton.addEventListener("click", () => leaveCurrent().catch((error) => log("Leave failed", { error: error.message })));
 
 stopAgentButton.addEventListener("click", async () => {
-  const result = await postJson("/api/agent/stop", {});
+  const result = await postJson("/api/agent/stop", { call_id: state.callId });
   log("Agent stop", result);
 });
 
@@ -1446,6 +1552,7 @@ saveEvaluationButton.addEventListener("click", () => saveEvaluation().catch((err
 
 evaluationNotesInput.addEventListener("input", updateEvaluationPreview);
 dictateEvaluationNotesButton.addEventListener("click", () => startEvaluationDictation(evaluationNotesInput, dictateEvaluationNotesButton));
+refreshToolEvaluationButton.addEventListener("click", () => refreshMetrics().catch((error) => log("Tool diagnostics refresh failed", { error: error.message })));
 if (!speechRecognitionConstructor()) {
   dictateEvaluationNotesButton.disabled = true;
   dictateEvaluationNotesButton.title = "Browser dictation is not available here. Use macOS dictation instead.";

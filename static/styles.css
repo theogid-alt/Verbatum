@@ -40,6 +40,7 @@ textarea {
 .client-kit,
 .integrations-panel,
 .evaluation-panel,
+.tool-eval-panel,
 .workspace,
 .lower {
   display: grid;
@@ -87,6 +88,7 @@ h2 {
 .client-kit,
 .integrations-panel,
 .evaluation-panel,
+.tool-eval-panel,
 .call-context,
 .room-panel,
 .metrics-panel,
@@ -111,6 +113,11 @@ h2 {
 }
 
 .evaluation-panel {
+  padding: 14px;
+  margin-bottom: 16px;
+}
+
+.tool-eval-panel {
   padding: 14px;
   margin-bottom: 16px;
 }
@@ -219,7 +226,8 @@ h2 {
 }
 
 .evaluation-summary,
-.evaluation-auto-grid {
+.evaluation-auto-grid,
+.tool-eval-grid {
   display: grid;
   gap: 8px;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -240,6 +248,7 @@ h2 {
 
 .evaluation-summary div,
 .evaluation-auto-grid div,
+.tool-eval-grid div,
 .evaluation-field {
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -249,6 +258,7 @@ h2 {
 
 .evaluation-summary span,
 .evaluation-auto-grid span,
+.tool-eval-grid span,
 .evaluation-field span {
   display: block;
   color: var(--muted);
@@ -256,10 +266,46 @@ h2 {
 }
 
 .evaluation-summary strong,
-.evaluation-auto-grid strong {
+.evaluation-auto-grid strong,
+.tool-eval-grid strong {
   display: block;
   margin-top: 2px;
   font-size: 18px;
+}
+
+.tool-eval-columns {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+}
+
+.tool-eval-columns h3 {
+  margin: 10px 0 8px;
+  font-size: 13px;
+  letter-spacing: 0;
+}
+
+.tool-eval-list {
+  display: grid;
+  gap: 8px;
+}
+
+.tool-eval-row {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fbfcfc;
+  padding: 9px 10px;
+}
+
+.tool-eval-row strong,
+.tool-eval-row span {
+  display: block;
+}
+
+.tool-eval-row span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .evaluation-fields {
@@ -616,6 +662,7 @@ button:disabled {
   .client-kit,
   .integrations-panel,
   .evaluation-panel,
+  .tool-eval-panel,
   .workspace,
   .lower {
     grid-template-columns: 1fr;
@@ -627,6 +674,8 @@ button:disabled {
 
   .evaluation-fields,
   .evaluation-auto-grid,
+  .tool-eval-grid,
+  .tool-eval-columns,
   .evaluation-summary,
   .evaluation-version-row {
     grid-template-columns: 1fr;

@@ -20,6 +20,7 @@ from verbatim.analytics.evaluation import (
     summarize_evaluations,
 )
 from verbatim.analytics.latency import summarize_call_events
+from verbatim.analytics.tool_evaluation import summarize_tool_evaluation
 from verbatim.client_config import ClientConfig, ClientConfigStore, integration_definitions
 from verbatim.config import clear_settings_cache, get_settings, validate_runtime_selection
 from verbatim.events import EventSink, load_events, new_id, normalize_event_name, safe_metadata
@@ -55,7 +56,7 @@ def create_app():
     from fastapi.responses import HTMLResponse
     from fastapi.staticfiles import StaticFiles
 
-    app = FastAPI(title="Verbatim V2 Voice Agent", version="0.3.2")
+    app = FastAPI(title="Verbatim V2 Voice Agent", version="0.4")
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/", response_class=HTMLResponse)
@@ -64,13 +65,14 @@ def create_app():
 
     @app.get("/api/health")
     async def health():
-        _prune_agent()
+        _prune_agents()
         settings = get_settings()
         return {
             "ok": True,
-            "version": "0.3.2",
+            "version": "0.4",
             "environment": settings.agent.environment,
             "active_agents": _active_agent_count(),
+            "max_active_agents": settings.session.max_active_agents,
         }
 
     @app.get("/api/config")
@@ -214,8 +216,7 @@ def create_app():
 
     @app.post("/api/rooms")
     async def create_room(payload: dict[str, Any] | None = None):
-        _prune_agent()
-        await _cancel_active_agent()
+        _prune_agents()
         clear_settings_cache()
         settings = _settings_from_payload(payload or {}, include_llm=False)
         client_config = _client_config(settings)
@@ -243,7 +244,7 @@ def create_app():
 
     @app.post("/api/agent/start")
     async def start_agent(payload: dict[str, Any] | None = None):
-        _prune_agent()
+        _prune_agents()
         clear_settings_cache()
         payload = payload or {}
         settings = _settings_from_payload(payload, include_llm=True)
@@ -269,9 +270,20 @@ def create_app():
             call_id = str(payload.get("call_id") or new_id("call"))
             session_id = str(payload.get("session_id") or new_id("sess"))
             room_url, room_token, room_name = _agent_room_values(settings, payload, call_id=call_id)
+            _ensure_agent_capacity(settings, call_id=call_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        await _cancel_active_agent()
+        active_agent = ACTIVE_AGENT.get(call_id)
+        if active_agent and not active_agent.done():
+            return {
+                "started": False,
+                "already_running": True,
+                "call_id": call_id,
+                "session_id": session_id,
+                "transport_provider": settings.providers.transport_provider,
+                "room_name": room_name,
+                "active_agents": _active_agent_count(),
+            }
         process = await _spawn_agent_worker(
             {
                 "transport_provider": settings.providers.transport_provider,
@@ -298,7 +310,6 @@ def create_app():
                 "llm_model": settings.providers.llm_model,
             }
         )
-        ACTIVE_AGENT.clear()
         ACTIVE_AGENT[call_id] = ActiveAgent(process=process)
         return {
             "started": True,
@@ -318,16 +329,22 @@ def create_app():
             "knowledge_base_chars": len(_effective_knowledge_base(settings, payload, client_config=client_config) or ""),
             "tools_enabled": tools_enabled,
             "enabled_tools": enabled_tools if tools_enabled else [],
+            "active_agents": _active_agent_count(),
+            "max_active_agents": settings.session.max_active_agents,
         }
 
     @app.post("/api/agent/stop")
     async def stop_agent(payload: dict[str, Any] | None = None):
-        stopped = await _cancel_active_agent()
+        payload = payload or {}
+        stopped = await _cancel_active_agent(
+            call_id=str(payload.get("call_id") or "").strip() or None,
+            stop_all=bool(payload.get("stop_all")),
+        )
         return {"stopped": stopped, "active_agents": _active_agent_count()}
 
     @app.get("/api/agent/status")
     async def agent_status():
-        _prune_agent()
+        _prune_agents()
         return {
             call_id: {
                 "done": agent.done(),
@@ -340,8 +357,7 @@ def create_app():
 
     @app.post("/api/hume/evi/session")
     async def hume_session(payload: dict[str, Any] | None = None):
-        _prune_agent()
-        await _cancel_active_agent()
+        _prune_agents()
         clear_settings_cache()
         payload = payload or {}
         settings = get_settings()
@@ -431,6 +447,15 @@ def create_app():
         items = load_events(transcript_path) if transcript_path else []
         return {"call_id": selected_call_id, "items": items[-100:]}
 
+    @app.get("/api/analytics/tool-evaluation")
+    async def analytics_tool_evaluation(call_id: str | None = None):
+        settings = get_settings()
+        events = load_events(settings.instrumentation.event_log_path)
+        selected_call_id = call_id or _latest_call_id(events)
+        summary = summarize_tool_evaluation(events, call_id=selected_call_id)
+        summary["latest_call_id"] = selected_call_id
+        return summary
+
     @app.get("/api/evaluations/rubric")
     async def evaluations_rubric():
         return load_rubric()
@@ -489,6 +514,8 @@ def _browser_config(settings) -> dict[str, Any]:
         "default_client_id": client_config.profile_id,
         "tools_enabled": settings.integrations.tools_enabled,
         "tool_timeout_ms": settings.integrations.tool_timeout_ms,
+        "active_agents": _active_agent_count(),
+        "max_active_agents": settings.session.max_active_agents,
         "caller_phone": "",
         "knowledge_base": client_config.knowledge_base,
         "client_config": _client_config_payload(settings, client_config=client_config),
@@ -958,11 +985,26 @@ async def _spawn_agent_worker(payload: dict[str, Any]) -> asyncio.subprocess.Pro
     return process
 
 
-async def _cancel_active_agent() -> bool:
+def _ensure_agent_capacity(settings, *, call_id: str) -> None:
+    _prune_agents()
+    if call_id in ACTIVE_AGENT:
+        return
+    max_active = max(1, int(settings.session.max_active_agents or 1))
+    if len(ACTIVE_AGENT) >= max_active:
+        raise ValueError(f"Maximum active agents reached ({max_active}). Stop a call before starting another.")
+
+
+async def _cancel_active_agent(*, call_id: str | None = None, stop_all: bool = False) -> bool:
     if not ACTIVE_AGENT:
         return False
-    agents = list(ACTIVE_AGENT.values())
-    ACTIVE_AGENT.clear()
+    if call_id and not stop_all:
+        selected = [(call_id, ACTIVE_AGENT.pop(call_id))] if call_id in ACTIVE_AGENT else []
+    else:
+        selected = list(ACTIVE_AGENT.items())
+        ACTIVE_AGENT.clear()
+    if not selected:
+        return False
+    agents = [agent for _, agent in selected]
     stopped = False
     for agent in agents:
         if agent.done():
@@ -981,14 +1023,14 @@ async def _cancel_active_agent() -> bool:
     return stopped
 
 
-def _prune_agent() -> None:
+def _prune_agents() -> None:
     for call_id, agent in list(ACTIVE_AGENT.items()):
         if agent.done():
             ACTIVE_AGENT.pop(call_id, None)
 
 
 def _active_agent_count() -> int:
-    _prune_agent()
+    _prune_agents()
     return len(ACTIVE_AGENT)
 
 

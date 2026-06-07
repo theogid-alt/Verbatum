@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -7,11 +7,12 @@ import respx
 
 from verbatim.config import Settings
 from verbatim.integrations.followup import FollowupService, followup_tools_ready
-from verbatim.integrations.scheduling import SchedulingService
+from verbatim.integrations.scheduling import SchedulingService, _business_window
 from verbatim.integrations.store import CALENDAR_TOOL_NAMES, IntegrationStore
 from verbatim.integrations.tools import (
     _accepts_suggested_slot,
     _booking_status_response,
+    _booking_action_needs_property_context,
     _booking_sms_body,
     _calendar_action_from_text,
     _asks_sms_status,
@@ -27,6 +28,7 @@ from verbatim.integrations.tools import (
     _merge_phone_fragments,
     _property_address_sms_body,
     _property_details_sms_body,
+    _sms_action_needs_property_context,
     _suggested_slot_repeat_response,
     _suggested_booking_action,
     _validate_phone,
@@ -34,7 +36,7 @@ from verbatim.integrations.tools import (
     build_scheduling_tools_schema,
     scheduling_tools_ready,
 )
-from verbatim.pipelines.pipecat import _unverified_tool_claim_replacement
+from verbatim.pipelines.pipecat import PipelineRecorder, _unverified_tool_claim_replacement
 
 
 class FakeNango:
@@ -890,11 +892,19 @@ def test_booking_status_and_suggested_slot_acceptance_cover_natural_confirmation
 
     assert _accepts_suggested_slot("That's amazing.", recent_tail="Yes, tomorrow is open.")
     assert _accepts_suggested_slot("Perfect.", recent_tail="I can do this slot.")
+    assert not _accepts_suggested_slot("Hold on.", recent_tail="Yes, that works.")
+    assert not _accepts_suggested_slot("What was the price again?", recent_tail="Yes, that works.")
     assert _booking_status_response(
         "What about the booking? It does not seem like it was booked.",
         last_booking_response=None,
         last_suggested_action=action,
     ).startswith("Not yet.")
+
+
+def test_suggested_slot_confirmation_does_not_use_stale_recent_tail():
+    assert not _accepts_suggested_slot("Hold on.", recent_tail="Yes, that works.")
+    assert not _accepts_suggested_slot("Can you repeat the address?", recent_tail="Yeah, perfect.")
+    assert _accepts_suggested_slot("Works.", recent_tail="")
 
 
 def test_sms_status_questions_are_tool_turns_not_llm_promises():
@@ -927,6 +937,62 @@ def test_llm_tool_truth_guard_blocks_fake_booking_and_sms_claims():
     assert _unverified_tool_claim_replacement("I sent the SMS confirmation.", recorder) is None
 
 
+def test_llm_tool_truth_guard_blocks_fake_property_sms_claims():
+    class Recorder:
+        calendar_booking_confirmed = False
+        sms_followup_sent = False
+
+    recorder = Recorder()
+
+    assert _unverified_tool_claim_replacement("I'll send the property details later.", recorder) == (
+        "I can send that once I know which property."
+    )
+    assert _unverified_tool_claim_replacement("You'll receive the details via SMS shortly.", recorder) == (
+        "I can send that by SMS once I know which property."
+    )
+    assert _unverified_tool_claim_replacement("I sent the property details by SMS.", recorder) == (
+        "I have not sent that SMS yet."
+    )
+
+
+def test_pipeline_recorder_tracks_tool_transactions():
+    class Sink:
+        agent_id = "agent"
+
+        def __init__(self):
+            self.events = []
+
+        def emit(self, event_name, *, provider="pipeline", turn_id=None, metadata=None):
+            event = {
+                "event_name": event_name,
+                "provider": provider,
+                "turn_id": turn_id,
+                "metadata": metadata or {},
+                "timestamp_monotonic_ms": 1.0,
+            }
+            self.events.append(event)
+            return event
+
+    recorder = PipelineRecorder(Settings.from_env({}), Sink())
+    transaction_id = recorder.start_tool_transaction("send_sms_followup", {"body": "secret body", "message_kind": "property_details"})
+    recorder.update_tool_transaction(transaction_id, status="running")
+    recorder.emit(
+        "tool.call.completed",
+        provider="tool",
+        metadata={
+            "tool_name": "send_sms_followup",
+            "tool_transaction_id": transaction_id,
+            "sms_sent": True,
+            "message_kind": "property_details",
+        },
+    )
+
+    assert recorder.tool_succeeded("send_sms_followup")
+    assert recorder.sms_followup_sent is True
+    assert "body" not in recorder.tool_transactions[transaction_id]["tool_arguments"]
+    assert recorder.tool_transactions[transaction_id]["tool_arguments"]["message_kind"] == "property_details"
+
+
 def test_calendar_action_recovers_split_booking_date_and_time():
     action = _calendar_action_from_text(
         latest_text="6:30 AM.",
@@ -936,6 +1002,95 @@ def test_calendar_action_recovers_split_booking_date_and_time():
     assert action
     assert action["tool_name"] == "prepare_and_confirm_calendar_booking"
     assert "T06:30:00" in action["arguments"]["start_iso"]
+
+
+def test_calendar_action_routes_next_week_to_availability_not_unsupported_read():
+    action = _calendar_action_from_text(
+        latest_text="No, another day next week preferably.",
+        recent_text="I want to book a viewing. No, another day next week preferably.",
+    )
+
+    assert action
+    assert action["tool_name"] == "check_calendar_availability"
+    assert action["arguments"]["date_iso"]
+
+
+def test_calendar_action_combines_split_viewing_request_without_lying_through_llm():
+    action = _calendar_action_from_text(
+        latest_text="one of your properties?",
+        recent_text="Can you help me book a visit for one of your properties?",
+    )
+
+    assert action
+    assert action["tool_name"] == "check_calendar_availability"
+
+
+def test_generic_booking_requires_property_context_before_calendar_write():
+    action = _calendar_action_from_text(
+        latest_text="I want to book a viewing for one of your properties.",
+        recent_text="I want to book a viewing for one of your properties.",
+    )
+
+    assert action
+    assert action["arguments"]["requires_property_context"] is True
+    assert _booking_action_needs_property_context(
+        action,
+        latest_text="I want to book a viewing for one of your properties.",
+        recent_text="I want to book a viewing for one of your properties.",
+        knowledge_base=None,
+    )
+
+
+def test_named_property_booking_can_continue_to_calendar_tool():
+    action = _calendar_action_from_text(
+        latest_text="Can we book Stella Maria next Monday at 2PM?",
+        recent_text="Can we book Stella Maria next Monday at 2PM?",
+    )
+
+    assert action
+    assert not _booking_action_needs_property_context(
+        action,
+        latest_text="Can we book Stella Maria next Monday at 2PM?",
+        recent_text="Can we book Stella Maria next Monday at 2PM?",
+        knowledge_base=None,
+    )
+
+
+def test_vague_property_sms_needs_clarification():
+    assert _sms_action_needs_property_context(
+        latest_text="Can you send me info on a property?",
+        recent_tail="",
+        knowledge_base=None,
+    )
+    assert not _sms_action_needs_property_context(
+        latest_text="Can you send me details on Stella Maria?",
+        recent_tail="",
+        knowledge_base=None,
+    )
+
+
+def test_calendar_action_checks_exact_slot_from_recent_booking_context_before_booking():
+    action = _calendar_action_from_text(
+        latest_text="Can you do Wednesday next week at 9:30AM?",
+        recent_text="I want to book a viewing. Can you do Wednesday next week at 9:30AM?",
+    )
+
+    assert action
+    assert action["tool_name"] == "check_calendar_conflict"
+    assert "T09:30:00" in action["arguments"]["start_iso"]
+
+
+def test_extract_date_understands_next_week_relative_to_calendar_week():
+    now = datetime(2026, 5, 30, 12, tzinfo=ZoneInfo("Europe/Paris"))
+
+    assert _extract_date("next week", now).date().isoformat() == "2026-06-01"
+    assert _extract_date("Wednesday next week", now).date().isoformat() == "2026-06-03"
+
+
+def test_business_window_without_date_avoids_same_day_near_immediate_slots():
+    start, _ = _business_window(date_iso=None, timezone="Europe/Paris")
+
+    assert start.date() >= (datetime.now(ZoneInfo("Europe/Paris")) + timedelta(days=1)).date()
 
 
 def test_calendar_response_suggests_next_slot_on_conflict():
@@ -1001,6 +1156,25 @@ def test_calendar_timeout_response_is_truthful_about_no_booking():
     )
 
     assert response == "The calendar tool timed out, so I did not book it."
+
+
+def test_calendar_read_tools_have_timeout_floor_for_nango_variance(tmp_path):
+    settings = Settings.from_env(
+        {
+            "DAILY_API_KEY": "daily",
+            "DEEPGRAM_API_KEY": "deepgram",
+            "GROQ_API_KEY": "groq",
+            "CARTESIA_API_KEY": "cartesia",
+            "VERBATIM_CARTESIA_VOICE_ID": "voice",
+            "VERBATIM_TOOL_TIMEOUT_MS": "2500",
+            "VERBATIM_INTEGRATIONS_DB_PATH": str(tmp_path / "integrations.db"),
+        }
+    )
+    runtime = SchedulingToolRuntime(settings=settings, client_id="client-a", recorder=object())
+
+    assert runtime._timeout_for("check_calendar_availability") == 4.0
+    assert runtime._timeout_for("check_calendar_conflict") == 4.0
+    assert runtime._timeout_for("confirm_calendar_booking") == 4.5
 
 
 def test_calendar_suggestion_becomes_actionable_booking_option():

@@ -38,6 +38,16 @@ Hume remains available in the UI for comparison.
 
 Tool calling runs by default on compatible Pipecat cascade calls when at least one safe tool backend is ready. Benchmark-only calls can still disable it with `VERBATIM_TOOLS_ENABLED=false`.
 
+## Concurrent Calls
+
+The local dashboard used to enforce one active bot globally to prevent orphan test agents. The server now allows one isolated worker per `call_id`, capped by:
+
+```bash
+VERBATIM_MAX_ACTIVE_AGENTS=8
+```
+
+Starting the same `call_id` twice returns `already_running` instead of creating a duplicate bot. The dashboard stop button stops the current call only; `POST /api/agent/stop` can still stop all workers with `{"stop_all": true}` for cleanup.
+
 The dashboard terminal shows safe tool facts while a call is running, including `calendar_checked`, `calendar_has_conflict`, `booking_booked`, `sms_sent`, `to_phone`, and duration. Calendar writes still require a confirmed booking path; SMS confirmation is sent only after a real booking exists.
 
 ## Local Client Kit
@@ -176,3 +186,5 @@ The evaluation layer is manual and post-call only. It reads existing v2 events, 
 ```
 
 Open the dashboard and click `Evaluate Current Call` after a test call. Set the bot version, for example `v01` or `v02`, score each field from 1-5, add optional notes, then click `Save Evaluation`. The summary endpoint groups reports by version so 100-call batches can be averaged cleanly. The v2 rubric is benchmark-inspired, with fields for realism, tool calling, latency, STT, intelligence, task success, conversation flow, and faithfulness/safety. No LLM judge, audio recording, or automatic pass/fail is enabled in v1.
+
+Current evaluation practice is iterative: fix obvious repeated issues as they appear, then move toward a stable release candidate. The near-term selling gate is 30 stable calls averaging above 4.0, with no repeated false tool claims, before heavier advertising.

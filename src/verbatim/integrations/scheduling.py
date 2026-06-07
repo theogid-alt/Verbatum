@@ -102,10 +102,11 @@ class SchedulingService:
             if _overlaps(start, end, busy_start, busy_end)
         ]
         duration_minutes = max(15, int((end - start).total_seconds() // 60))
+        min_suggestion_start = max(end, datetime.now(start.tzinfo or ZoneInfo(timezone)) + timedelta(minutes=30))
         suggested_slots = [
             slot
             for slot in _available_slots(day_start, day_end, busy, duration_minutes=duration_minutes)
-            if parse_iso_datetime(slot["start_iso"]) >= end
+            if parse_iso_datetime(slot["start_iso"]) >= min_suggestion_start
         ][:3]
         if conflicts and not suggested_slots:
             suggested_slots = await self._next_available_slots_after(
@@ -345,7 +346,10 @@ def _business_window(*, date_iso: str | None, timezone: str) -> tuple[datetime, 
         else:
             base = base.astimezone(tz)
     else:
-        base = datetime.now(tz)
+        # If the caller has not named a day, avoid absurd "30 minutes from now"
+        # viewing proposals. Default to the next calendar day and let callers
+        # ask for today explicitly when they mean it.
+        base = datetime.now(tz) + timedelta(days=1)
     start = base.replace(hour=9, minute=0, second=0, microsecond=0)
     if start < datetime.now(tz):
         start = datetime.now(tz).replace(second=0, microsecond=0) + timedelta(minutes=30)

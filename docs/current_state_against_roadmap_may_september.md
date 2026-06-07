@@ -58,7 +58,7 @@ Transport input
 -> assistant context aggregation
 ```
 
-The main app is a FastAPI service with one active agent worker at a time. Starting a new call stops the previous worker. This worker isolation was one of the most important stability improvements because it prevents Daily and LiveKit SDK state from contaminating each other in a long-running Python process.
+The main app is a FastAPI service with one isolated agent worker per active call. Earlier local builds allowed only one active worker globally; the current lifecycle maps one `call_id` to one worker and allows separate calls to run concurrently up to `VERBATIM_MAX_ACTIVE_AGENTS`. This worker isolation was one of the most important stability improvements because it prevents Daily and LiveKit SDK state from contaminating each other in a long-running Python process.
 
 ### Current Stack
 
@@ -862,7 +862,7 @@ Do not change:
 ```text
 LiveKit + Flux + Groq + Sonic-3
 worker isolation
-one active agent
+one isolated worker per active call
 short prompt
 safe tool surface
 ```

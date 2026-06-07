@@ -8,6 +8,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from verbatim.config import Settings
+from verbatim.events import new_id
 from verbatim.integrations.followup import FollowupService, followup_tools_ready
 from verbatim.integrations.nango import NangoClient
 from verbatim.integrations.scheduling import SchedulingService
@@ -152,6 +153,8 @@ class SchedulingToolRuntime:
         self.timeout_secs = max(settings.integrations.tool_timeout_ms, 1) / 1000
 
     def _timeout_for(self, tool_name: str) -> float:
+        if tool_name in {"check_calendar_availability", "check_calendar_conflict"}:
+            return max(self.timeout_secs, 4.0)
         if tool_name in {"confirm_calendar_booking", "cancel_calendar_booking"}:
             return max(self.timeout_secs, 4.5)
         if tool_name == "send_sms_followup":
@@ -178,7 +181,7 @@ class SchedulingToolRuntime:
                 name,
                 self._handler_for(name),
                 cancel_on_interruption=True,
-                timeout_secs=self.timeout_secs,
+                timeout_secs=self._timeout_for(name),
             )
         return tools_schema
 
@@ -196,7 +199,17 @@ class SchedulingToolRuntime:
     async def _run_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         started = time.monotonic()
         timeout_secs = self._timeout_for(tool_name)
-        self._emit("tool.call.started", tool_name=tool_name, outcome="started")
+        transaction_id = None
+        if hasattr(self.recorder, "start_tool_transaction"):
+            transaction_id = self.recorder.start_tool_transaction(tool_name, arguments)
+            if hasattr(self.recorder, "update_tool_transaction"):
+                self.recorder.update_tool_transaction(transaction_id, status="running")
+        self._emit(
+            "tool.call.started",
+            tool_name=tool_name,
+            outcome="started",
+            metadata={"tool_transaction_id": transaction_id, "tool_status": "running"} if transaction_id else None,
+        )
         try:
             if tool_name not in self.enabled_tools:
                 result = {"ok": False, "outcome": "tool_disabled", "message": f"{tool_name} is disabled for this agent."}
@@ -284,6 +297,12 @@ class SchedulingToolRuntime:
         duration_ms = round((time.monotonic() - started) * 1000, 1)
         event_name = "tool.call.completed" if result.get("ok") else "tool.call.failed"
         result_metadata = _tool_result_metadata(tool_name, result, caller_phone=self.caller_phone)
+        message_kind = _optional_str(arguments.get("message_kind"))
+        if message_kind:
+            result_metadata["message_kind"] = message_kind
+        if transaction_id:
+            result_metadata["tool_transaction_id"] = transaction_id
+            result_metadata["tool_status"] = "succeeded" if result.get("ok") else "failed"
         if result.get("outcome") == "confirmation_required":
             self._emit(
                 "tool.confirmation.required",
@@ -315,6 +334,13 @@ class SchedulingToolRuntime:
             duration_ms=duration_ms,
             metadata=result_metadata,
         )
+        if transaction_id and hasattr(self.recorder, "update_tool_transaction"):
+            self.recorder.update_tool_transaction(
+                transaction_id,
+                status="succeeded" if result.get("ok") else "failed",
+                outcome=str(result.get("outcome") or ("ok" if result.get("ok") else "failed")),
+                metadata=result_metadata,
+            )
         return result
 
     def _emit(
@@ -442,6 +468,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             self.last_sms_response: str | None = None
             self.awaiting_sms_offer_response = False
             self.pending_booking_fragments: list[str] = []
+            self.active_tool_trace: dict[str, Any] | None = None
 
         async def process_frame(self, frame, direction: FrameDirection):
             await super().process_frame(frame, direction)
@@ -458,14 +485,55 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             recent_user_texts = getattr(recorder, "recent_user_texts", [])
             recent_text = " ".join((self.pending_booking_fragments + recent_user_texts)[-10:])
             recent_tail = " ".join(recent_user_texts[-3:])
+            if _is_unusual_agent_inquiry(latest_text):
+                if turn_id:
+                    handled_turns.add(turn_id)
+                recorder.emit(
+                    "tool.direct.skipped",
+                    provider="tool",
+                    metadata={
+                        "tool_interaction_id": new_id("toolint"),
+                        "client_id": client_id,
+                        "outcome": "human_followup_needed",
+                        "tool_name": "handoff_followup",
+                        "user_request": latest_text,
+                        "parsed_intent": "human_handoff",
+                        "text_preview": latest_text[:160],
+                    },
+                    once_per_turn=True,
+                )
+                await self._push_response("Got it. I will have an agent follow up on this number.", direction, trace=None)
+                return
             sms_result = await self._handle_sms_followup_turn(
                 latest_text=latest_text,
                 recent_tail=recent_tail,
                 direction=direction,
             )
             if sms_result:
+                self._clear_pending_booking_offer()
                 if turn_id:
                     handled_turns.add(turn_id)
+                return
+
+            if self.last_suggested_action and _rejects_confirmation(latest_text):
+                self._clear_pending_booking_offer()
+                if turn_id:
+                    handled_turns.add(turn_id)
+                recorder.emit(
+                    "tool.direct.skipped",
+                    provider="tool",
+                    metadata={
+                        "tool_interaction_id": new_id("toolint"),
+                        "client_id": client_id,
+                        "outcome": "pending_booking_rejected",
+                        "tool_name": "prepare_calendar_booking",
+                        "user_request": latest_text,
+                        "parsed_intent": "booking_rejected",
+                        "text_preview": latest_text[:160],
+                    },
+                    once_per_turn=True,
+                )
+                await self._push_response("No problem, I have not booked it.", direction, trace=None)
                 return
 
             if self.last_suggested_action and _asks_to_repeat_suggested_slot(latest_text):
@@ -475,15 +543,21 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                     "tool.direct.skipped",
                     provider="tool",
                     metadata={
+                        "tool_interaction_id": new_id("toolint"),
                         "client_id": client_id,
                         "outcome": "suggested_slot_repeated",
                         "tool_name": "check_calendar_availability",
+                        "user_request": latest_text,
+                        "parsed_intent": "repeat_suggested_slot",
                         "text_preview": latest_text[:160],
                     },
                     once_per_turn=True,
                 )
-                await self._push_response(_suggested_slot_repeat_response(self.last_suggested_action), direction)
+                await self._push_response(_suggested_slot_repeat_response(self.last_suggested_action), direction, trace=None)
                 return
+
+            if self.last_suggested_action and _clears_pending_suggested_action(latest_text):
+                self._clear_pending_booking_offer()
 
             status_response = _booking_status_response(
                 latest_text,
@@ -497,13 +571,17 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                     "tool.direct.skipped",
                     provider="tool",
                     metadata={
+                        "tool_interaction_id": new_id("toolint"),
                         "client_id": client_id,
                         "outcome": "booking_already_closed",
+                        "tool_name": "booking_status",
+                        "user_request": latest_text,
+                        "parsed_intent": "booking_status",
                         "text_preview": latest_text[:160],
                     },
                     once_per_turn=True,
                 )
-                await self._push_response(status_response, direction)
+                await self._push_response(status_response, direction, trace=None)
                 return
 
             if self.last_booking_response and not _has_post_booking_tool_intent(latest_text):
@@ -511,14 +589,55 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 return
 
             tool_latest_text = latest_text
-            if self.last_suggested_action and _accepts_suggested_slot(latest_text, recent_tail=recent_tail):
+            if self.last_suggested_action and _accepts_suggested_slot(latest_text):
                 action = _copy_calendar_action(self.last_suggested_action)
                 if not _is_explicit_booking_confirmation(latest_text):
                     tool_latest_text = f"{latest_text} yes"
             else:
                 action = _calendar_action_from_text(latest_text=latest_text, recent_text=recent_text)
             if not action:
+                if _looks_like_tool_turn(latest_text):
+                    recorder.emit(
+                        "tool.intent.unresolved",
+                        provider="tool",
+                        metadata={
+                            "tool_interaction_id": new_id("toolint"),
+                            "client_id": client_id,
+                            "user_request": latest_text,
+                            "parsed_intent": "unresolved",
+                            "tool_name": None,
+                            "text_preview": latest_text[:160],
+                            "failure_source": "intent_detection",
+                        },
+                        once_per_turn=True,
+                    )
                 await self.push_frame(frame, direction)
+                return
+            if action["tool_name"] == "unsupported_calendar_read":
+                trace = self._trace_action(latest_text=latest_text, action=action, reason="unsupported_calendar_read")
+                if turn_id:
+                    handled_turns.add(turn_id)
+                recorder.emit(
+                    "tool.direct.skipped",
+                    provider="tool",
+                    metadata={
+                        "tool_interaction_id": trace["tool_interaction_id"],
+                        "client_id": client_id,
+                        **_tool_integration_metadata(settings, action["tool_name"]),
+                        "tool_name": action["tool_name"],
+                        "outcome": "unsupported_calendar_read",
+                        "calendar_checked": False,
+                        "user_request": latest_text,
+                        "parsed_intent": trace["parsed_intent"],
+                        "text_preview": latest_text[:160],
+                    },
+                    once_per_turn=True,
+                )
+                await self._push_response(
+                    _calendar_response_text(action, {"ok": False, "outcome": "unsupported_calendar_read"}),
+                    direction,
+                    trace={**trace, "result": {"ok": False, "outcome": "unsupported_calendar_read"}},
+                )
                 return
             if action["tool_name"] not in enabled_tools and action["tool_name"] != "prepare_and_confirm_calendar_booking":
                 if _is_calendar_action(action):
@@ -540,14 +659,44 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                     "tool.direct.skipped",
                     provider="tool",
                     metadata={
+                        "tool_interaction_id": new_id("toolint"),
                         "client_id": client_id,
                         "outcome": "missing_connection",
                         "tool_name": action["tool_name"],
+                        "user_request": latest_text,
+                        "parsed_intent": _parsed_intent_for_action(action, latest_text=latest_text),
                         "text_preview": latest_text[:160],
                     },
                     once_per_turn=True,
                 )
-                await self._push_response("Your calendar is not connected yet.", direction)
+                await self._push_response("Your calendar is not connected yet.", direction, trace=None)
+                return
+            if _booking_action_needs_property_context(
+                action,
+                latest_text=latest_text,
+                recent_text=recent_text,
+                knowledge_base=getattr(session, "knowledge_base", None),
+            ):
+                if turn_id:
+                    handled_turns.add(turn_id)
+                recorder.emit(
+                    "tool.direct.skipped",
+                    provider="tool",
+                    metadata={
+                        "tool_interaction_id": new_id("toolint"),
+                        "client_id": client_id,
+                        **_tool_integration_metadata(settings, action["tool_name"]),
+                        "tool_name": action["tool_name"],
+                        "outcome": "missing_property_context",
+                        "calendar_checked": False,
+                        "booking_booked": False,
+                        "user_request": latest_text,
+                        "parsed_intent": _parsed_intent_for_action(action, latest_text=latest_text),
+                        "text_preview": latest_text[:160],
+                    },
+                    once_per_turn=True,
+                )
+                await self._push_response("Which property should I book the viewing for?", direction, trace=None)
                 return
             if action.get("arguments", {}).get("missing_details"):
                 self._remember_booking_fragment(latest_text)
@@ -562,13 +711,21 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                             "duration_minutes": 30,
                         },
                     }
+                    trace = self._trace_action(
+                        latest_text=latest_text,
+                        action=availability_action,
+                        reason="suggest_slots_for_missing_booking_details",
+                    )
                     recorder.emit(
                         "tool.direct.activated",
                         provider="tool",
                         metadata={
+                            "tool_interaction_id": trace["tool_interaction_id"],
                             "client_id": client_id,
                             **_tool_integration_metadata(settings, "check_calendar_availability"),
                             "tool_name": "check_calendar_availability",
+                            "user_request": latest_text,
+                            "parsed_intent": trace["parsed_intent"],
                             "text_preview": latest_text[:160],
                             "direct_tool": True,
                             "reason": "suggest_slots_for_missing_booking_details",
@@ -576,10 +733,15 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                         once_per_turn=True,
                     )
                     result = await _run_calendar_action(runtime, availability_action, latest_text=latest_text)
+                    self._trace_result(trace, result)
                     suggested_action = _suggested_booking_action(result)
                     if suggested_action:
-                        self.last_suggested_action = suggested_action
-                    await self._push_response(_calendar_response_text(availability_action, result), direction)
+                        self._set_pending_booking_offer(suggested_action)
+                    await self._push_response(
+                        _calendar_response_text(availability_action, result),
+                        direction,
+                        trace={**trace, "result": result},
+                    )
                     return
                 if turn_id:
                     handled_turns.add(turn_id)
@@ -587,17 +749,24 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                     "tool.direct.skipped",
                     provider="tool",
                     metadata={
+                        "tool_interaction_id": new_id("toolint"),
                         "client_id": client_id,
                         **_tool_integration_metadata(settings, action["tool_name"]),
                         "tool_name": action["tool_name"],
                         "outcome": "missing_booking_details",
                         "calendar_checked": False,
                         "booking_booked": False,
+                        "user_request": latest_text,
+                        "parsed_intent": _parsed_intent_for_action(action, latest_text=latest_text),
                         "text_preview": latest_text[:160],
                     },
                     once_per_turn=True,
                 )
-                await self._push_response(_calendar_response_text(action, {"ok": False, "outcome": "missing_booking_details"}), direction)
+                await self._push_response(
+                    _calendar_response_text(action, {"ok": False, "outcome": "missing_booking_details"}),
+                    direction,
+                    trace=None,
+                )
                 return
             if action["tool_name"] == "cancel_calendar_booking" and self.last_booking_id:
                 action["arguments"]["booking_id"] = self.last_booking_id
@@ -611,37 +780,45 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                     "tool.direct.skipped",
                     provider="tool",
                     metadata={
+                        "tool_interaction_id": new_id("toolint"),
                         "client_id": client_id,
                         "outcome": "duplicate_booking_prevented",
                         "tool_name": action["tool_name"],
+                        "user_request": latest_text,
+                        "parsed_intent": _parsed_intent_for_action(action, latest_text=latest_text),
                         "text_preview": latest_text[:160],
                     },
                     once_per_turn=True,
                 )
-                await self._push_response(response_text, direction)
+                await self._push_response(response_text, direction, trace=None)
                 return
 
+            trace = self._trace_action(latest_text=latest_text, action=action, reason="direct_tool")
             if turn_id:
                 handled_turns.add(turn_id)
             recorder.emit(
                 "tool.direct.activated",
                 provider="tool",
                 metadata={
+                    "tool_interaction_id": trace["tool_interaction_id"],
                     "client_id": client_id,
                     **_tool_integration_metadata(settings, action["tool_name"]),
                     "tool_name": action["tool_name"],
+                    "user_request": latest_text,
+                    "parsed_intent": trace["parsed_intent"],
                     "text_preview": latest_text[:160],
                     "direct_tool": True,
                 },
                 once_per_turn=True,
             )
             result = await _run_calendar_action(runtime, action, latest_text=tool_latest_text)
+            self._trace_result(trace, result)
             response_text = _calendar_response_text(action, result)
             suggested_action = _suggested_booking_action(result)
             if suggested_action:
-                self.last_suggested_action = suggested_action
+                self._set_pending_booking_offer(suggested_action)
             elif action["tool_name"] == "prepare_and_confirm_calendar_booking" and result.get("outcome") == "confirmation_required":
-                self.last_suggested_action = _copy_calendar_action(action)
+                self._set_pending_booking_offer(_copy_calendar_action(action))
             if signature and result.get("ok") and result.get("outcome") == "booking_confirmed":
                 self.pending_booking_fragments = []
                 self.booked_signatures.add(signature)
@@ -649,7 +826,7 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 self.last_booking_response = booking_response
                 booking = result.get("booking") or {}
                 self.last_booking_id = str(booking.get("id") or "") or self.last_booking_id
-                self.last_suggested_action = None
+                self._clear_pending_booking_offer()
                 self.pending_sms_body = _booking_sms_body(
                     result,
                     fallback=booking_response,
@@ -665,14 +842,34 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 self.pending_booking_fragments = []
                 self.last_booking_response = None
                 self.last_booking_id = None
-                self.last_suggested_action = None
+                self._clear_pending_booking_offer()
                 self.pending_sms_body = None
                 self.last_confirmable_sms_body = None
                 self.last_sms_response = None
                 self.awaiting_sms_offer_response = False
-            await self._push_response(response_text, direction)
+            await self._push_response(response_text, direction, trace={**trace, "result": result})
 
-        async def _push_response(self, response_text: str, direction: FrameDirection) -> None:
+        async def _push_response(self, response_text: str, direction: FrameDirection, *, trace: dict[str, Any] | None = None) -> None:
+            match = _assistant_response_reality(response_text, trace.get("result") if trace else None)
+            trace_metadata = {
+                "tool_interaction_id": trace.get("tool_interaction_id") if trace else None,
+                "tool_name": trace.get("tool_name") if trace else None,
+                "parsed_intent": trace.get("parsed_intent") if trace else None,
+                **match,
+            }
+            recorder.emit(
+                "tool.assistant.response",
+                provider="tool",
+                metadata={
+                    key: value
+                    for key, value in {
+                        **trace_metadata,
+                        "assistant_response": response_text,
+                        "text_preview": response_text[:160],
+                    }.items()
+                    if value not in {None, ""}
+                },
+            )
             recorder.emit(
                 "transcript.assistant",
                 provider="tool",
@@ -690,6 +887,48 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 self.pending_booking_fragments.append(cleaned)
             self.pending_booking_fragments = self.pending_booking_fragments[-6:]
 
+        def _set_pending_booking_offer(self, action: dict[str, Any]) -> None:
+            self.last_suggested_action = action
+
+        def _clear_pending_booking_offer(self) -> None:
+            self.last_suggested_action = None
+
+        def _trace_action(self, *, latest_text: str, action: dict[str, Any], reason: str | None = None) -> dict[str, Any]:
+            interaction_id = new_id("toolint")
+            parsed_intent = _parsed_intent_for_action(action, latest_text=latest_text)
+            metadata = {
+                "tool_interaction_id": interaction_id,
+                "client_id": client_id,
+                "user_request": latest_text,
+                "parsed_intent": parsed_intent,
+                "tool_name": action.get("tool_name"),
+                "tool_arguments": _safe_tool_trace_arguments(action.get("arguments") or {}),
+                "direct_tool": True,
+            }
+            if reason:
+                metadata["reason"] = reason
+            recorder.emit("tool.intent.parsed", provider="tool", metadata=metadata)
+            return {
+                "tool_interaction_id": interaction_id,
+                "user_request": latest_text,
+                "parsed_intent": parsed_intent,
+                "tool_name": action.get("tool_name"),
+                "tool_arguments": _safe_tool_trace_arguments(action.get("arguments") or {}),
+            }
+
+        def _trace_result(self, trace: dict[str, Any], result: dict[str, Any]) -> None:
+            recorder.emit(
+                "tool.execution.result",
+                provider="tool",
+                metadata={
+                    "tool_interaction_id": trace.get("tool_interaction_id"),
+                    "tool_name": trace.get("tool_name"),
+                    "parsed_intent": trace.get("parsed_intent"),
+                    "tool_execution_succeeded": bool(result.get("ok")),
+                    **_safe_tool_result_snapshot(result),
+                },
+            )
+
         async def _handle_sms_followup_turn(self, *, latest_text: str, recent_tail: str, direction: FrameDirection) -> bool:
             wants_sms = _asks_for_sms_followup(latest_text)
             asks_sms_status = _asks_sms_status(latest_text)
@@ -703,11 +942,14 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                         "tool.direct.skipped",
                         provider="tool",
                         metadata={
+                            "tool_interaction_id": new_id("toolint"),
                             "client_id": client_id,
                             **_tool_integration_metadata(settings, "send_sms_followup"),
                             "tool_name": "send_sms_followup",
                             "outcome": "sms_not_ready",
                             "sms_sent": False,
+                            "user_request": latest_text,
+                            "parsed_intent": "sms_followup",
                             "text_preview": latest_text[:160],
                         },
                         once_per_turn=True,
@@ -728,6 +970,13 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                 return False
             if wants_sms or asks_sms_status:
                 if message_kind == "address":
+                    if not self.last_booking_response and _sms_action_needs_property_context(
+                        latest_text=latest_text,
+                        recent_tail=recent_tail,
+                        knowledge_base=getattr(session, "knowledge_base", None),
+                    ):
+                        await self._push_response("Which property should I send the address for?", direction)
+                        return True
                     await self._send_property_address_sms(latest_text=latest_text, recent_tail=recent_tail, direction=direction)
                     return True
                 if self.last_confirmable_sms_body and _asks_to_send_previous_sms(latest_text):
@@ -738,6 +987,13 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                     )
                     return True
                 if message_kind == "property_details":
+                    if not self.last_booking_response and _sms_action_needs_property_context(
+                        latest_text=latest_text,
+                        recent_tail=recent_tail,
+                        knowledge_base=getattr(session, "knowledge_base", None),
+                    ):
+                        await self._push_response("Which property should I send details for?", direction)
+                        return True
                     await self._send_property_details_sms(
                         latest_text=latest_text,
                         recent_tail=recent_tail,
@@ -746,6 +1002,13 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                     return True
                 if not self.pending_sms_body and not self.last_booking_response:
                     if wants_sms:
+                        if not self.last_booking_response and _sms_action_needs_property_context(
+                            latest_text=latest_text,
+                            recent_tail=recent_tail,
+                            knowledge_base=getattr(session, "knowledge_base", None),
+                        ):
+                            await self._push_response("Which property should I send details for?", direction)
+                            return True
                         await self._send_property_details_sms(
                             latest_text=latest_text,
                             recent_tail=recent_tail,
@@ -756,12 +1019,15 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                         "tool.direct.skipped",
                         provider="tool",
                         metadata={
+                            "tool_interaction_id": new_id("toolint"),
                             "client_id": client_id,
                             **_tool_integration_metadata(settings, "send_sms_followup"),
                             "tool_name": "send_sms_followup",
                             "outcome": "missing_confirmed_booking",
                             "sms_sent": False,
                             "to_phone": runtime.caller_phone,
+                            "user_request": latest_text,
+                            "parsed_intent": "sms_followup",
                             "text_preview": latest_text[:160],
                         },
                         once_per_turn=True,
@@ -784,25 +1050,30 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                     "message_kind": "property_details",
                 },
             }
+            trace = self._trace_action(latest_text=latest_text, action=action, reason="sms_property_details")
             recorder.emit(
                 "tool.direct.activated",
                 provider="tool",
                 metadata={
+                    "tool_interaction_id": trace["tool_interaction_id"],
                     "client_id": client_id,
                     **_tool_integration_metadata(settings, "send_sms_followup"),
                     "tool_name": "send_sms_followup",
                     "caller_phone_configured": bool(runtime.caller_phone),
                     "direct_tool": True,
                     "message_kind": "property_details",
+                    "user_request": latest_text,
+                    "parsed_intent": trace["parsed_intent"],
                     "text_preview": f"{recent_tail} {latest_text}".strip()[:160],
                 },
                 once_per_turn=True,
             )
             result = await _run_followup_action(runtime, action)
+            self._trace_result(trace, result)
             response_text = _followup_response_text(action, result)
             if result.get("ok"):
                 self.last_sms_response = "Yes, I sent the property details."
-            await self._push_response(response_text, direction)
+            await self._push_response(response_text, direction, trace={**trace, "result": result})
 
         async def _send_property_address_sms(self, *, latest_text: str, recent_tail: str, direction: FrameDirection) -> None:
             action = {
@@ -816,25 +1087,30 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                     "message_kind": "property_address",
                 },
             }
+            trace = self._trace_action(latest_text=latest_text, action=action, reason="sms_property_address")
             recorder.emit(
                 "tool.direct.activated",
                 provider="tool",
                 metadata={
+                    "tool_interaction_id": trace["tool_interaction_id"],
                     "client_id": client_id,
                     **_tool_integration_metadata(settings, "send_sms_followup"),
                     "tool_name": "send_sms_followup",
                     "caller_phone_configured": bool(runtime.caller_phone),
                     "direct_tool": True,
                     "message_kind": "property_address",
+                    "user_request": latest_text,
+                    "parsed_intent": trace["parsed_intent"],
                     "text_preview": f"{recent_tail} {latest_text}".strip()[:160],
                 },
                 once_per_turn=True,
             )
             result = await _run_followup_action(runtime, action)
+            self._trace_result(trace, result)
             response_text = _followup_response_text(action, result)
             if result.get("ok"):
                 self.last_sms_response = "Yes, I sent the address."
-            await self._push_response(response_text, direction)
+            await self._push_response(response_text, direction, trace={**trace, "result": result})
 
         async def _push_unavailable_calendar_response(self, *, action: dict[str, Any], latest_text: str, direction: FrameDirection) -> None:
             metadata = {
@@ -848,9 +1124,9 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
             }
             recorder.emit("tool.direct.skipped", provider="tool", metadata=metadata, once_per_turn=True)
             if action["tool_name"] == "prepare_and_confirm_calendar_booking":
-                await self._push_response("I cannot book it yet because Google Calendar is not connected.", direction)
+                await self._push_response("Calendar booking is not enabled for this agent.", direction)
             else:
-                await self._push_response("I cannot check the calendar yet because Google Calendar is not connected.", direction)
+                await self._push_response("Calendar checking is not enabled for this agent.", direction)
 
         async def _send_sms_confirmation(self, *, sms_body: str, latest_text: str, direction: FrameDirection) -> None:
             action = {
@@ -861,27 +1137,33 @@ def create_calendar_action_processor(settings: Settings, session: Any, recorder:
                     "message_kind": "viewing_confirmation",
                 },
             }
+            trace = self._trace_action(latest_text=latest_text, action=action, reason="sms_viewing_confirmation")
             recorder.emit(
                 "tool.direct.activated",
                 provider="tool",
                 metadata={
+                    "tool_interaction_id": trace["tool_interaction_id"],
                     "client_id": client_id,
                     **_tool_integration_metadata(settings, "send_sms_followup"),
                     "tool_name": "send_sms_followup",
                     "caller_phone_configured": bool(runtime.caller_phone),
                     "direct_tool": True,
+                    "message_kind": "viewing_confirmation",
+                    "user_request": latest_text,
+                    "parsed_intent": trace["parsed_intent"],
                     "text_preview": latest_text[:160],
                 },
                 once_per_turn=True,
             )
             result = await _run_followup_action(runtime, action)
+            self._trace_result(trace, result)
             response_text = _followup_response_text(action, result)
             if result.get("ok"):
                 self.pending_sms_body = None
                 self.last_confirmable_sms_body = None
                 self.awaiting_sms_offer_response = False
                 self.last_sms_response = "Yes, I sent the viewing confirmation."
-            await self._push_response(response_text, direction)
+            await self._push_response(response_text, direction, trace={**trace, "result": result})
 
     return CalendarActionProcessor()
 
@@ -899,6 +1181,129 @@ def _looks_like_scheduling_turn(text: str) -> bool:
 def _looks_like_tool_turn(text: str) -> bool:
     lowered = text.lower()
     return _looks_like_scheduling_turn(lowered) or _asks_for_sms_followup(lowered)
+
+
+def _parsed_intent_for_action(action: dict[str, Any], *, latest_text: str = "") -> str:
+    tool_name = str(action.get("tool_name") or "")
+    arguments = action.get("arguments") or {}
+    lowered = latest_text.lower()
+    if tool_name == "unsupported_calendar_read":
+        return "unsupported_calendar_read"
+    if arguments.get("missing_details"):
+        return "missing_information"
+    if tool_name == "check_calendar_availability":
+        return "availability_lookup"
+    if tool_name == "check_calendar_conflict":
+        return "availability_lookup" if re.search(r"\b(free|open|available|availability)\b", lowered) else "conflict_check"
+    if tool_name == "prepare_and_confirm_calendar_booking":
+        return "booking"
+    if tool_name == "prepare_calendar_booking":
+        return "booking_prepare"
+    if tool_name == "confirm_calendar_booking":
+        return "booking_confirm"
+    if tool_name == "cancel_calendar_booking":
+        return "cancellation"
+    if tool_name == "send_sms_followup":
+        message_kind = str(arguments.get("message_kind") or "")
+        if message_kind:
+            return f"sms_{message_kind}"
+        return "sms_followup"
+    return tool_name or "unknown"
+
+
+def _safe_tool_trace_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    safe_keys = {
+        "date_iso",
+        "start_iso",
+        "end_iso",
+        "timezone",
+        "duration_minutes",
+        "title",
+        "channel",
+        "message_kind",
+        "pending_booking_id",
+        "missing_details",
+        "missing_day",
+        "missing_time",
+        "requires_property_context",
+    }
+    return {
+        key: str(value)[:220] if not isinstance(value, (int, float, bool)) else value
+        for key, value in arguments.items()
+        if key in safe_keys and value not in {None, ""}
+    }
+
+
+def _safe_tool_result_snapshot(result: dict[str, Any]) -> dict[str, Any]:
+    safe_keys = {
+        "ok",
+        "outcome",
+        "requires_confirmation",
+        "has_conflict",
+        "idempotent",
+        "message",
+        "destination_preview",
+        "message_id",
+        "pending_booking_id",
+        "start_iso",
+        "end_iso",
+    }
+    payload = {
+        key: str(value)[:240] if isinstance(value, str) else value
+        for key, value in result.items()
+        if key in safe_keys and value not in {None, ""}
+    }
+    booking = result.get("booking") if isinstance(result.get("booking"), dict) else None
+    if booking:
+        payload["booking_id"] = booking.get("id")
+        payload["calendar_event_id"] = booking.get("external_event_id")
+        payload["start_iso"] = booking.get("start_iso")
+        payload["end_iso"] = booking.get("end_iso")
+    if isinstance(result.get("slots"), list):
+        payload["slot_count"] = len(result.get("slots") or [])
+    if isinstance(result.get("suggested_slots"), list):
+        payload["suggested_slot_count"] = len(result.get("suggested_slots") or [])
+    return {key: value for key, value in payload.items() if value not in {None, ""}}
+
+
+def _assistant_response_reality(response_text: str, result: dict[str, Any] | None) -> dict[str, Any]:
+    lowered = response_text.lower()
+    claims_booking_success = bool(
+        re.search(
+            r"\b(booked|scheduled|added)\b.*\b(viewing|appointment|calendar|booking)\b|"
+            r"\b(viewing|appointment|booking)\b.*\b(booked|scheduled|added)\b|"
+            r"\b(viewing|appointment|booking)\s+is\s+confirmed\b",
+            lowered,
+        )
+    )
+    claims_sms_success = bool(
+        re.search(
+            r"\b(done|sent|texted|messaged|all set)\b.*\b(sms|text|message|confirmation|details|address|info|information)\b|"
+            r"\b(details|address|confirmation|sms|text|message)\b.*\b(done|sent|texted|messaged|all set)\b",
+            lowered,
+        )
+    )
+    claims_availability = bool(re.search(r"\b(yes|yep),?.{0,30}\b(open|free|available)\b|\bi can do\b", lowered))
+    outcome = str((result or {}).get("outcome") or "")
+    ok = bool((result or {}).get("ok"))
+    mismatch_reasons: list[str] = []
+    if claims_booking_success and not (ok and outcome == "booking_confirmed"):
+        mismatch_reasons.append("booking_success_without_confirmed_tool")
+    if claims_sms_success and not (ok and outcome in {"sms_sent", "whatsapp_sent"}):
+        mismatch_reasons.append("sms_success_without_sent_tool")
+    if claims_availability and result and not (
+        ok
+        and (
+            outcome == "available_slots"
+            or (outcome == "calendar_conflict_checked" and not bool(result.get("has_conflict")))
+        )
+    ):
+        mismatch_reasons.append("availability_claim_without_open_result")
+    return {
+        "assistant_claimed_success": bool(claims_booking_success or claims_sms_success or claims_availability),
+        "assistant_response_matched_reality": not mismatch_reasons,
+        "assistant_mismatch_reason": ", ".join(mismatch_reasons) if mismatch_reasons else None,
+    }
 
 
 async def _run_calendar_action(runtime: SchedulingToolRuntime, action: dict[str, Any], *, latest_text: str) -> dict[str, Any]:
@@ -951,7 +1356,7 @@ def _calendar_action_from_text(*, latest_text: str, recent_text: str) -> dict[st
         return None
     if _asks_booking_status(latest) and not _asks_to_create_booking(latest):
         return None
-    if _asks_for_viewing_without_slot(latest):
+    if _asks_for_viewing_without_slot(latest) or _continues_split_viewing_request(latest, lowered):
         date_time = _extract_calendar_datetime(combined)
         date_value = _extract_date(combined, datetime.now(ZoneInfo("Europe/Paris")))
         return {
@@ -960,10 +1365,24 @@ def _calendar_action_from_text(*, latest_text: str, recent_text: str) -> dict[st
                 "date_iso": date_time["date_iso"] if date_time else (date_value.date().isoformat() if date_value else None),
                 "timezone": "Europe/Paris",
                 "duration_minutes": 30,
+                "requires_property_context": True,
             },
         }
     recent_has_booking_context = _asks_to_create_booking(lowered) or bool(re.search(r"\b(viewing|appointment|property tour)\b", lowered))
     latest_supplies_time = _has_time(latest) or _extract_date(latest, datetime.now(ZoneInfo("Europe/Paris"))) is not None
+    if recent_has_booking_context and _asks_for_relative_slot_options(latest):
+        date_value = _extract_date(latest, datetime.now(ZoneInfo("Europe/Paris"))) or _extract_date(
+            combined,
+            datetime.now(ZoneInfo("Europe/Paris")),
+        )
+        return {
+            "tool_name": "check_calendar_availability",
+            "arguments": {
+                "date_iso": date_value.date().isoformat() if date_value else None,
+                "timezone": "Europe/Paris",
+                "duration_minutes": 30,
+            },
+        }
     should_book = (
         _asks_to_create_booking(latest)
         or (recent_has_booking_context and latest_supplies_time)
@@ -975,7 +1394,7 @@ def _calendar_action_from_text(*, latest_text: str, recent_text: str) -> dict[st
             missing_args = _missing_calendar_details(combined)
             return {
                 "tool_name": "prepare_and_confirm_calendar_booking",
-                "arguments": {"missing_details": True, **missing_args},
+                "arguments": {"missing_details": True, "requires_property_context": True, **missing_args},
             }
         return {
             "tool_name": "prepare_and_confirm_calendar_booking",
@@ -985,6 +1404,7 @@ def _calendar_action_from_text(*, latest_text: str, recent_text: str) -> dict[st
                 "timezone": date_time["timezone"],
                 "title": "Property viewing",
                 "notes": "Booked by Verbatim voice agent after caller request.",
+                "requires_property_context": True,
             },
         }
     if _asks_for_calendar_conflict(latest) or (
@@ -1033,7 +1453,7 @@ def _calendar_action_from_text(*, latest_text: str, recent_text: str) -> dict[st
             missing_args = _missing_calendar_details(combined)
             return {
                 "tool_name": "prepare_and_confirm_calendar_booking",
-                "arguments": {"missing_details": True, **missing_args},
+                "arguments": {"missing_details": True, "requires_property_context": True, **missing_args},
             }
         return {
             "tool_name": "prepare_and_confirm_calendar_booking",
@@ -1043,6 +1463,7 @@ def _calendar_action_from_text(*, latest_text: str, recent_text: str) -> dict[st
                 "timezone": date_time["timezone"],
                 "title": "Property viewing",
                 "notes": "Booked by Verbatim voice agent after caller request.",
+                "requires_property_context": True,
             },
         }
     return None
@@ -1339,16 +1760,38 @@ def _rejects_confirmation(text: str) -> bool:
 
 
 def _accepts_suggested_slot(text: str, *, recent_tail: str = "") -> bool:
-    combined = f"{recent_tail} {text}".lower()
-    if re.search(r"\b(no|nope|not yet|wait|hold on|don'?t|do not|wrong|cancel|never mind|nevermind|repeat|say that again|what (?:day|date|time))\b", combined):
+    del recent_tail
+    current = text.lower()
+    if re.search(r"\b(no|nope|not yet|wait|hold on|don'?t|do not|wrong|cancel|never mind|nevermind|repeat|say that again|what (?:day|date|time))\b", current):
+        return False
+    if _has_unrelated_followup_question(current) or _is_property_info_only_turn(current):
         return False
     return bool(
         re.search(
-            r"\b(that works|works for me|sounds good|let'?s do it|do it|book it|yes|yeah|yep|ok|okay|"
+            r"\b(that works|works|works for me|sounds good|let'?s do it|do it|book it|yes|yeah|yep|ok|okay|"
             r"sure|absolutely|great|amazing|perfect|wonderful|fine|that'?s fine|the one you (?:just )?suggested|that one)\b",
-            combined,
+            current,
         )
     )
+
+
+def _clears_pending_suggested_action(text: str) -> bool:
+    lowered = text.lower()
+    if not lowered.strip():
+        return False
+    if _accepts_suggested_slot(lowered):
+        return False
+    if _asks_to_repeat_suggested_slot(lowered) or _asks_booking_status(lowered):
+        return False
+    if _rejects_confirmation(lowered):
+        return True
+    if _asks_for_sms_followup(lowered) or _asks_sms_status(lowered):
+        return True
+    if _is_property_info_only_turn(lowered) or _has_unrelated_followup_question(lowered):
+        return True
+    if _asks_to_create_booking(lowered) or _asks_for_calendar_conflict(lowered) or _asks_for_availability(lowered):
+        return True
+    return len(lowered.split()) > 7 and bool(re.search(r"\b(what|why|how|where|who|tell|explain|price|details|info|agent|human|supervisor)\b", lowered))
 
 
 def _is_explicit_booking_confirmation(text: str) -> bool:
@@ -1402,6 +1845,104 @@ def _asks_for_viewing_without_slot(text: str) -> bool:
     return bool(
         re.search(r"\b(visit|view|see|come by|tour)\b", lowered)
         and re.search(r"\b(property|home|house|villa|apartment|flat|listing|one|it)\b", lowered)
+    )
+
+
+def _booking_action_needs_property_context(
+    action: dict[str, Any],
+    *,
+    latest_text: str,
+    recent_text: str,
+    knowledge_base: str | None,
+) -> bool:
+    arguments = action.get("arguments") or {}
+    if not arguments.get("requires_property_context"):
+        return False
+    combined = f"{recent_text} {latest_text}".strip()
+    if _allows_general_viewing(combined):
+        return False
+    return not _has_specific_property_context(combined, knowledge_base=knowledge_base)
+
+
+def _sms_action_needs_property_context(*, latest_text: str, recent_tail: str, knowledge_base: str | None) -> bool:
+    combined = f"{recent_tail} {latest_text}".strip()
+    return not _has_specific_property_context(combined, knowledge_base=knowledge_base)
+
+
+def _allows_general_viewing(text: str) -> bool:
+    lowered = text.lower()
+    return bool(
+        re.search(
+            r"\b(general viewing|general visit|any property is fine|whatever property|not sure which property|"
+            r"agent can choose|agent will choose)\b",
+            lowered,
+        )
+    )
+
+
+def _has_specific_property_context(text: str, *, knowledge_base: str | None = None) -> bool:
+    lowered = text.lower()
+    if not lowered.strip():
+        return False
+    if re.search(r"\b[A-Z][a-z0-9'-]{2,}(?:\s+[A-Z][a-z0-9'-]{2,})+\b", text):
+        return True
+    if re.search(r"\b(a|any|some|one of your|random)\s+propert(?:y|ies)\b", lowered):
+        return bool(re.search(r"\b(called|named|in|at|ref|reference|listing|unit|tower|residence|estate)\b", lowered))
+    if re.search(r"\b(this|that|the)\s+(property|listing|apartment|villa|house|unit|one)\b", lowered):
+        return True
+    if re.search(r"\b(called|named|ref|reference|listing|unit)\b.{0,50}\b[a-z0-9][a-z0-9-]{2,}\b", lowered):
+        return True
+    if re.search(r"\b(in|at)\s+[a-z][a-z0-9-]{2,}(?:\s+[a-z][a-z0-9-]{2,}){0,4}\b", lowered):
+        return True
+    if re.search(r"\b(tower|residence|residences|estate|marina|downtown|jumeirah|palm|creek|hills|business bay)\b", lowered):
+        return True
+    for token in _knowledge_base_property_tokens(knowledge_base):
+        if re.search(rf"\b{re.escape(token)}\b", lowered):
+            return True
+    return False
+
+
+def _knowledge_base_property_tokens(knowledge_base: str | None) -> list[str]:
+    if not knowledge_base:
+        return []
+    tokens: list[str] = []
+    for line in knowledge_base.splitlines()[:20]:
+        match = re.search(r"\b(?:property|name|listing|building|tower)\s*[:\-]\s*([A-Za-z0-9][A-Za-z0-9\s'/-]{2,60})", line)
+        if match:
+            value = re.sub(r"\s+", " ", match.group(1).strip().lower())
+            if value and len(value) >= 3:
+                tokens.extend(part for part in (value, *value.split()) if len(part) >= 4)
+    return list(dict.fromkeys(tokens))[:20]
+
+
+def _is_unusual_agent_inquiry(text: str) -> bool:
+    lowered = text.lower()
+    return bool(
+        re.search(r"\b(i'?m|i am|we are)\b.{0,40}\b(agent|broker|realtor|agency)\b", lowered)
+        and re.search(r"\b(buyer|client|offer|buy|purchase|interested)\b", lowered)
+    )
+
+
+def _continues_split_viewing_request(latest_text: str, combined_text: str) -> bool:
+    latest = latest_text.lower().strip()
+    if len(latest.split()) > 8:
+        return False
+    if not re.search(r"\b(property|properties|listing|one|it|just|please)\b", latest):
+        return False
+    return _asks_for_viewing_without_slot(combined_text)
+
+
+def _asks_for_relative_slot_options(text: str) -> bool:
+    lowered = text.lower()
+    if _has_time(lowered):
+        return False
+    return bool(
+        re.search(r"\b(next week|another day|different day|other day|some time next week|next available)\b", lowered)
+        or (
+            _extract_date(lowered, datetime.now(ZoneInfo("Europe/Paris"))) is not None
+            and not _has_time(lowered)
+            and re.search(r"\b(prefer|available|free|open|slot|another|next|instead)\b", lowered)
+        )
     )
 
 
@@ -1459,9 +2000,9 @@ def _suggested_slot_repeat_response(action: dict[str, Any]) -> str:
 
 
 def _asks_to_book(text: str) -> bool:
-    return bool(re.search(r"\b(book|schedule|set up|put|add|create)\b", text)) and bool(
-        re.search(r"\b(calendar|appointment|meeting|viewing|slot|it|that)\b", text)
-    )
+    if not re.search(r"\b(book|schedule|set up|put|add|create)\b", text):
+        return False
+    return bool(re.search(r"\b(calendar|appointment|meeting|viewing|slot|it|that)\b", text)) or _has_time(text)
 
 
 def _asks_to_create_booking(text: str) -> bool:
@@ -1483,7 +2024,11 @@ def _asks_for_availability(text: str) -> bool:
 
 
 def _asks_for_unsupported_calendar_read(text: str) -> bool:
-    return bool(re.search(r"\b(next|upcoming|what.*calendar|calendar.*have|events?)\b", text)) and not _asks_to_book(text)
+    if _asks_to_book(text):
+        return False
+    if _extract_date(text, datetime.now(ZoneInfo("Europe/Paris"))) is not None:
+        return False
+    return bool(re.search(r"\b(upcoming|what.*calendar|calendar.*have|events?)\b", text))
 
 
 def _extract_calendar_datetime(text: str) -> dict[str, str] | None:
@@ -1526,6 +2071,9 @@ def _extract_date(text: str, now: datetime) -> datetime | None:
         return now
     if "tomorrow" in lowered:
         return now + timedelta(days=1)
+    next_week_date = _extract_next_week_date(lowered, now)
+    if next_week_date:
+        return next_week_date
     explicit_month_day = _extract_explicit_month_day(lowered, now)
     if explicit_month_day:
         return explicit_month_day
@@ -1567,6 +2115,26 @@ def _extract_date(text: str, now: datetime) -> datetime | None:
             delta = (index - now.weekday()) % 7
             return now + timedelta(days=delta or 7)
     return None
+
+
+def _extract_next_week_date(text: str, now: datetime) -> datetime | None:
+    if not re.search(r"\bnext week\b", text):
+        return None
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    days_until_next_monday = (7 - now.weekday()) % 7 or 7
+    next_week_start = now + timedelta(days=days_until_next_monday)
+    for name, index in weekdays.items():
+        if re.search(rf"\b{name}\b", text):
+            return next_week_start + timedelta(days=index)
+    return next_week_start
 
 
 def _extract_explicit_month_day(text: str, now: datetime) -> datetime | None:

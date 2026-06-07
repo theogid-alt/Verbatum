@@ -65,10 +65,17 @@ def test_tools_controls_are_default_and_sent_to_agent_start():
     assert "/api/evaluations/call" in script
     assert "evaluateCallButton" in script
     assert "saveEvaluationButton" in script
+    assert '"/api/agent/stop", { call_id: state.callId }' in script
     assert "/api/integrations/nango/connect-session" in script
     assert 'type="checkbox"' in Path("static/index.html").read_text()
     assert "Reset to Current Stack" in Path("static/index.html").read_text()
     assert "Evaluate Current Call" in Path("static/index.html").read_text()
-    assert 'value="v0.3.2"' in Path("static/index.html").read_text()
+    assert 'value="v0.4"' in Path("static/index.html").read_text()
     assert "dictateEvaluationNotesButton" in script
     assert "startEvaluationDictation" in script
+    assert "/api/analytics/tool-evaluation" in script
+    assert "renderToolEvaluation" in script
+    assert "tool.intent.parsed" in script
+    assert "tool.execution.result" in script
+    assert "Tool Diagnostics" in Path("static/index.html").read_text()
+    assert "refreshToolEvaluationButton" in Path("static/index.html").read_text()
